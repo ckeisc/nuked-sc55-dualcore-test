@@ -746,9 +746,27 @@ void CMinimalApp::StopSplitPCM()
 	// anymore.
 	m_bSplitActive = false;
 	SplitDMB();
+	// Bounded wait (defense, not a root fix): a core-3 stall inside
+	// a batch used to hang this wait silently, before the run line,
+	// so a recurrence was indistinguishable from a dead kernel. On
+	// timeout, log core-3 state and proceed so the stall is
+	// diagnosable instead of silent.
+	const u64 nParkStartUs = CTimer::GetClockTicks();
 	while (!m_bPCMIdle)
 	{
 		SplitDMB();
+		if (CTimer::GetClockTicks() - nParkStartUs >= 5000000ULL)
+		{
+			ThreadSplitStateCircle* pS = m_pSplitState;
+			LogLine("splitpark_timeout ticks=%llu idle=%d raw_lock=%u pub=%llu rendered=%llu writer_want=%u",
+			        static_cast<unsigned long long>(pS != nullptr ? pS->ticks : 0),
+			        m_bPCMIdle ? 1 : 0,
+			        pS != nullptr ? pS->raw_lock : 0,
+			        static_cast<unsigned long long>(pS != nullptr ? pS->cycles_pub : 0),
+			        static_cast<unsigned long long>(pS != nullptr ? pS->pcm_rendered : 0),
+			        pS != nullptr ? pS->writer_want : 0);
+			break;
+		}
 		MiniPause();
 	}
 	SplitDMB();
