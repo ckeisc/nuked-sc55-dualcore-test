@@ -38,7 +38,7 @@
 //   There is no queue-flush API in Circle, so this tail is inherent
 //   to any chunked-write design, mt32-pi's included.
 // - EVENT LOGGING: every incoming CONTROL event is logged to
-//   shaped-var2-stats.log with name + parameters + t= timestamp:
+//   shaped-var3-stats.log with name + parameters + t= timestamp:
 //   MiSTer I2C init/down/synth/romset/soundfont/mute/writefail,
 //   variant advances, and sequence_done. The MIDI stream is NEVER
 //   logged (hundreds of events/s would flood). No OSD text is
@@ -55,7 +55,7 @@
 //   -> song_end -> STOP (post-song_end idle: silence, clean idle
 //   windows, LED heartbeat unchanged, never restart, never loop).
 //   The advance
-//   path (DoVariantAdvance) is SEPARATE from the deleted song-toggle
+//   path (DoRunAdvance) is SEPARATE from the deleted song-toggle
 //   DoSwitch: same Reset + GS_RESET + InitSplitState(true) +
 //   resampler reset, but NO song change, NO cycle line, NO abort
 //   line (the old variant's song completed).
@@ -206,6 +206,7 @@
 #include "pcm.h"
 #include "rom.h"
 #include "split_thread_circle.h"
+#include "mcu_timer.h"
 #include "rom_io.h"
 #include "sha256.h"
 #include "standard_romsets.h"
@@ -241,7 +242,8 @@ constexpr u64 StepsPerFrameBudget = 300;
 // per-variant accumulator arrays (headroom for the pending
 // variants 4/5 -- adding them extends sequence_done's explicit
 // fields mechanically, no dispatch rewrite).
-constexpr int MaxVariants = 8;
+// (Round 3) MaxVariants is gone: the RUN table below (g_runs) drives the
+// auto-sequence; per-run totals are scalar accumulators, printed per run.
 
 // MiSTer link: Pi is the I2C master, MiSTer User Port slave at 0x45,
 // 3-byte status {synth, romset, soundfont}. Poll at 10 ms (5x
@@ -267,7 +269,7 @@ constexpr u8 MisterSynthVariant = 0xA2;
 constexpr float Sample24BitMax = static_cast<float>((1 << 23) - 1);
 
 // Stats file (SD root) and window length.
-const char MinimalStatsPath[] = "SD:/shaped-var2-stats.log";
+const char MinimalStatsPath[] = "SD:/shaped-var3-stats.log";
 constexpr u64 WindowUs = 5000000ULL;	// 5 s -> 240,000 frames at 48 kHz
 
 // Scheduler-free pause for spin waits (this kernel registers no
@@ -329,6 +331,133 @@ static uint64_t PMU_CalibrateNop()
     const uint64_t nFirst = PMU_ReadCycles();
     return PMU_ReadCycles() - nFirst;
 }
+
+// ---------------------------------------------------------------------------
+// ROUND 3 SYNC (2026-10-31): sync profiles, timer modes, and the RUN table.
+//
+// A RUN is (PCM_Update variant, sync profile, timer mode). The
+// auto-sequence plays E1M1 once per run, in table order, and stops
+// after the last one. Run 0 is the shaped-var baseline: every knob at
+// its legacy value, so the reference does not move. Each later run
+// adds ONE lever (or runs a validation), so the log isolates each
+// lever's effect on core-2 cycles/step, core-3 cycles/tick and pct.
+// The PCM variants (pcm.cpp g_pcmVariants, 0-5) are one AXIS of a run;
+// the sync/timer levers are the other two. See
+// docs/optimization-round3-sync-20261031.md.
+// ---------------------------------------------------------------------------
+
+// Sync profiles (coordination knobs, see split_thread_circle.h).
+//   number, short, full, lock_mode, legacy_lock, legacy_timing, legacy_irq, publish_interval, ring_check_interval, core3_backoff
+const SplitSyncProfile g_splitSyncProfiles[] = {
+	{0, "legacy", "shaped-var sync exactly: batch lock (CSpinLock IRQ_LEVEL), CTimer+ISB timing on every lock op, direct IRQ0, publish every step, ring check every step, tight idle spin",
+	 SPLIT_LOCK_BATCH, 1, 1, 1, 1, 1, 0},
+	{1, "trim", "overhead trim only: padded state, raw TASK lock, contended-only timing, IRQ0 flag, publish/8, ring check/16, idle backoff 64 (batch lock kept)",
+	 SPLIT_LOCK_BATCH, 0, 0, 0, 8, 16, 64},
+	{2, "tick", "trim + per-tick lock hand-off (core-2 wait bounded by one PCM tick)",
+	 SPLIT_LOCK_TICK, 0, 0, 0, 8, 16, 64},
+	{3, "fifo", "trim + deferred-store FIFO (core 2 never waits; stores land at tick boundaries = single-threaded semantics)",
+	 SPLIT_LOCK_FIFO, 0, 0, 0, 8, 16, 64},
+	{4, "free", "trim + NO lock (EXPERIMENT: upper bound of lock removal; lost-update hazard, never ship)",
+	 SPLIT_LOCK_FREE, 0, 0, 0, 8, 16, 64},
+	{5, "fifo32", "fifo with publish every 32 steps (publish-interval sensitivity)",
+	 SPLIT_LOCK_FIFO, 0, 0, 0, 32, 16, 64},
+};
+const int g_splitSyncProfileCount = sizeof(g_splitSyncProfiles) / sizeof(g_splitSyncProfiles[0]);
+
+// Run table.
+struct TRun
+{
+	const char* name;	// <= 8 chars (LCD "VAR nn name")
+	int pcm;		// g_pcmVariants number (0 baseline, 1 sched, 2 pipe, 3 neon2, 4 splitacc, 5 layout)
+	int sync;		// g_splitSyncProfiles number
+	int timer;		// TIMER_MODE_LEGACY / LAZY / CHECK
+};
+static const TRun g_runs[] = {
+	{"base",    0, 0, TIMER_MODE_LEGACY},	// 0: the reference (shaped-var behaviour)
+	{"trim",    0, 1, TIMER_MODE_LEGACY},	// 1: + sync overhead trim (layout, raw lock, publish/8, ring/16, IRQ0 flag, cheap timing)
+	{"tick",    0, 2, TIMER_MODE_LEGACY},	// 2: + per-tick lock hand-off
+	{"fifo",    0, 3, TIMER_MODE_LEGACY},	// 3: + deferred-store FIFO (no core-2 waits)
+	{"fifolz",  0, 3, TIMER_MODE_LAZY},	// 4: + lazy timer (the core-2 compute lever)
+	{"free",    0, 4, TIMER_MODE_LEGACY},	// 5: upper bound: no lock at all (experiment)
+	{"fifo32",  0, 5, TIMER_MODE_LEGACY},	// 6: publish-interval sensitivity (8 -> 32)
+	{"tchk",    0, 3, TIMER_MODE_CHECK},	// 7: VALIDATION: lazy timer vs shadow legacy, mismatches logged (tchk=)
+	{"schedlz", 1, 3, TIMER_MODE_LAZY},	// 8: PCM variant sched on fifo + lazy timer
+	{"pipelz",  2, 3, TIMER_MODE_LAZY},	// 9: PCM variant pipe, same
+	{"neon2lz", 3, 3, TIMER_MODE_LAZY},	// 10: PCM variant neon2, same
+	{"splitlz", 4, 3, TIMER_MODE_LAZY},	// 11: PCM variant splitacc (upstream round 3), same
+	{"layoutlz", 5, 3, TIMER_MODE_LAZY},	// 12: PCM variant layout (upstream round 3), same
+};
+static const int g_runCount = sizeof(g_runs) / sizeof(g_runs[0]);
+
+static inline const TRun& RunDesc(int nRun)
+{
+	if (nRun < 0 || nRun >= g_runCount)
+		nRun = 0;
+	return g_runs[nRun];
+}
+static inline int RunPcm(int nRun) { return RunDesc(nRun).pcm; }
+static inline int RunSync(int nRun) { return RunDesc(nRun).sync; }
+static inline int RunTimer(int nRun) { return RunDesc(nRun).timer; }
+static const SplitSyncProfile& SyncProfile(int nNumber)
+{
+	for (int i = 0; i < g_splitSyncProfileCount; ++i)
+		if (g_splitSyncProfiles[i].number == nNumber)
+			return g_splitSyncProfiles[i];
+	return g_splitSyncProfiles[0];
+}
+
+// The split state is a STATIC object (64-byte aligned by its type):
+// its cache-line layout is the point of the round-3 padding, and
+// Circle's operator new gives no alignment guarantee for over-aligned
+// types.
+static ThreadSplitStateCircle s_SplitState;
+
+// PMU event counters (round 3). Four events per core, in this order:
+//   0: INST_RETIRED (0x08), 1: BR_MIS_PRED (0x10),
+//   2: L1D_CACHE_REFILL (0x03), 3: L2D_CACHE_REFILL (0x17).
+// 32-bit counters: they wrap in ~4 s at 1 GHz, so they are sampled
+// per step-loop call (core 2, ~5 ms) and per batch (core 3) as 32-bit
+// deltas into 64-bit accumulators. Filter bits 31/30 cleared = count
+// at every exception level (same filter as PMCCFILTR above).
+static inline void PMU_EnableEvents()
+{
+	__asm__ volatile ("msr pmevtyper0_el0, %0" :: "r" ((uint64_t)0x08) : "memory");
+	__asm__ volatile ("msr pmevtyper1_el0, %0" :: "r" ((uint64_t)0x10) : "memory");
+	__asm__ volatile ("msr pmevtyper2_el0, %0" :: "r" ((uint64_t)0x03) : "memory");
+	__asm__ volatile ("msr pmevtyper3_el0, %0" :: "r" ((uint64_t)0x17) : "memory");
+	__asm__ volatile ("msr pmcntenset_el0, %0" :: "r" ((uint64_t)0xF) : "memory");
+	__asm__ volatile ("isb" ::: "memory");
+}
+static inline void PMU_ReadEvents(u32 pOut[4])
+{
+	uint64_t v0, v1, v2, v3;
+	__asm__ volatile ("mrs %0, pmevcntr0_el0" : "=r" (v0));
+	__asm__ volatile ("mrs %0, pmevcntr1_el0" : "=r" (v1));
+	__asm__ volatile ("mrs %0, pmevcntr2_el0" : "=r" (v2));
+	__asm__ volatile ("mrs %0, pmevcntr3_el0" : "=r" (v3));
+	pOut[0] = static_cast<u32>(v0);
+	pOut[1] = static_cast<u32>(v1);
+	pOut[2] = static_cast<u32>(v2);
+	pOut[3] = static_cast<u32>(v3);
+}
+// Validation: the instruction counter must advance across a short
+// busy loop (~1 ms wall timeout). A stuck counter -> the core's event
+// fields report 0 and the boot line says pmevN=fail.
+static bool PMU_ValidateEvents()
+{
+	u32 a[4], b[4];
+	PMU_ReadEvents(a);
+	const u64 nStartUs = CTimer::GetClockTicks();
+	while (true)
+	{
+		PMU_ReadEvents(b);
+		if (b[0] != a[0])
+			return true;
+		if (CTimer::GetClockTicks() - nStartUs >= 1000ULL)
+			return false;
+	}
+}
+
 
 namespace
 {
@@ -449,13 +578,12 @@ const char* SongName(int nSong)
 // pcm.cpp (single source of truth: the table owns the names, so a
 // follow-up adding variants needs no change here). Unknown numbers
 // report "unknown" (never a wrong name).
-const char* VariantName(int nVariant)
+// Run index -> short name (LCD + log). Unknown indexes report
+// "unknown" (never a wrong name).
+const char* RunName(int nRun)
 {
-	for (int i = 0; i < g_pcmVariantCount; ++i)
-	{
-		if (g_pcmVariants[i].number == nVariant)
-			return g_pcmVariants[i].short_name;
-	}
+	if (nRun >= 0 && nRun < g_runCount)
+		return g_runs[nRun].name;
 	return "unknown";
 }
 
@@ -502,13 +630,8 @@ CMinimalApp::CMinimalApp(CI2CMaster* pI2CMaster, CInterruptSystem* pInterrupt)
 	  m_nCurrentSong(0),
 	  m_bSongDone(false),
 	  m_bPaused(false),
-	  m_nCurrentVariant(0),
+	  m_nCurrentRun(0),
 	  m_bSequenceDone(false),
-	  m_nVarProd{0, 0, 0, 0, 0, 0, 0, 0},
-	  m_nVarPcmCyc{0, 0, 0, 0, 0, 0, 0, 0},
-	  m_nVarMixCyc{0, 0, 0, 0, 0, 0, 0, 0},
-	  m_nVarStepCyc{0, 0, 0, 0, 0, 0, 0, 0},
-	  m_nVarLockCyc{0, 0, 0, 0, 0, 0, 0, 0},
 	  m_bPmu3Done(false),
 	  m_bPmu3Ok(false),
 	  m_bPmu2Ok(false),
@@ -622,7 +745,17 @@ void CMinimalApp::InitSplitState(bool bClearRing)
 	// Caller guarantees: PCM task parked (or never started) and the
 	// MCU thread not stepping (chunk boundary, or pre-activation).
 	if (!m_pSplitState)
-		m_pSplitState = new ThreadSplitStateCircle;
+		m_pSplitState = &s_SplitState;
+
+	// Round 3: install the current run's sync profile and timer mode
+	// BEFORE the state is (re)initialized and published. Both are read
+	// by the backend on every step/batch; changing them here is safe
+	// because the PCM task is parked and the MCU is not stepping.
+	{
+		const int nRun = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
+		m_pSplitState->sync = SyncProfile(RunSync(nRun));
+		TIMER_SetMode(*m_pEmulator->GetMCU().timer, static_cast<uint8_t>(RunTimer(nRun)));
+	}
 
 	m_pSplitState->InitFromPCM(m_pEmulator->GetPCM(), m_pEmulator->GetMCU());
 
@@ -678,6 +811,9 @@ void CMinimalApp::ResetWindow()
 	m_nWinSoundDrops = 0;
 	m_nWinStepWallCyc = 0;
 	m_nWinStepCalls = 0;
+	m_nWinSteps = 0;
+	for (int i = 0; i < 4; ++i)
+		m_nWinC2Ev[i] = 0;
 	if (m_pSplitState)
 	{
 		ThreadSplitStateCircle& S = *m_pSplitState;
@@ -688,6 +824,13 @@ void CMinimalApp::ResetWindow()
 		m_nLastPCMCyc = S.pcm_task_cyc;
 		m_nLastMixCyc = S.mix_cyc;
 		m_nLastLockCyc = S.lock_wait_cyc;
+		m_nLastTicks = S.ticks;
+		m_nLastPublishes = S.publishes;
+		m_nLastLockContended = S.lock_contended;
+		m_nLastIrq0Folded = S.irq0_folded;
+		m_nLastFifoFull = S.fifo_full_waits;
+		for (int i = 0; i < 4; ++i)
+			m_nLastC3Ev[i] = S.c3_ev[i];
 	}
 	m_nWinStartUs = CTimer::GetClockTicks();
 }
@@ -781,7 +924,11 @@ void CMinimalApp::WriteWindow(bool bPaused)
 	// is the validity signal. var=N is the variant this window ran
 	// under; per-variant totals accumulate into that variant's slot
 	// (until sequence_done, after which idle windows stop adding).
-	const u64 nLockUs         = S.lock_wait_us - m_nLastLockUs;
+	// Round 3: with the cheap (contended-only, unfenced) lock timing
+	// there are no CTimer reads, so lock_us is DERIVED from the spin
+	// cycles at 1 GHz; the legacy profile keeps the measured value.
+	const u64 nLockUs         = S.sync.legacy_timing ? (S.lock_wait_us - m_nLastLockUs)
+	                                                 : ((m_bPmu2Ok ? S.lock_wait_cyc - m_nLastLockCyc : 0) / 1000ULL);
 	const u64 nLockWaits      = S.lock_waits - m_nLastLockWaits;
 	const u64 nMcuUs          = m_nWinCore2Us >= nLockUs ? m_nWinCore2Us - nLockUs : 0;
 	const u64 nCore3Pct       = nElapsedUs > 0 ? nPCMUs * 100 / nElapsedUs : 0;
@@ -804,18 +951,43 @@ void CMinimalApp::WriteWindow(bool bPaused)
 		const u64 nWallCorrected = m_nWinStepWallCyc >= nNop2 * m_nWinStepCalls ? m_nWinStepWallCyc - nNop2 * m_nWinStepCalls : 0;
 		nStepCyc = nWallCorrected >= nLockRaw ? nWallCorrected - nLockRaw : 0;
 	}
-	const int nVariant = __atomic_load_n(&m_nCurrentVariant, __ATOMIC_ACQUIRE);
+	const int nVariant = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
 	m_nSongDue = m_nSongDue + nDue;
-	if (!m_bSequenceDone && nVariant >= 0 && nVariant < g_pcmVariantCount && nVariant < MaxVariants)
+	// Round-3 window deltas.
+	const u64 nTicks        = S.ticks - m_nLastTicks;
+	const u64 nPubs         = S.publishes - m_nLastPublishes;
+	const u64 nLockCont     = S.lock_contended - m_nLastLockContended;
+	const u64 nIrq0         = S.irq0_folded - m_nLastIrq0Folded;
+	const u64 nFifoFull     = S.fifo_full_waits - m_nLastFifoFull;
+	u64 nC3Ev[4];
+	for (int i = 0; i < 4; ++i)
+		nC3Ev[i] = m_bPmuEv3Ok ? S.c3_ev[i] - m_nLastC3Ev[i] : 0;
+	u64 nC2Ev[4];
+	for (int i = 0; i < 4; ++i)
+		nC2Ev[i] = m_bPmuEv2Ok ? m_nWinC2Ev[i] : 0;
+	const TimerCheckStatus tchk = TIMER_GetCheckStatus(*m_pEmulator->GetMCU().timer);
+	const char* pTchk = tchk.active ? (tchk.mismatches == 0 ? "ok" : "FAIL") : "off";
+	if (!m_bSequenceDone && !bPaused)
 	{
-		m_nVarProd[nVariant] = m_nVarProd[nVariant] + m_nWinProd;
-		m_nVarPcmCyc[nVariant] = m_nVarPcmCyc[nVariant] + nPCMCyc;
-		m_nVarMixCyc[nVariant] = m_nVarMixCyc[nVariant] + nMixCyc;
-		m_nVarStepCyc[nVariant] = m_nVarStepCyc[nVariant] + nStepCyc;
-		m_nVarLockCyc[nVariant] = m_nVarLockCyc[nVariant] + nLockCyc;
+		m_nRunProd = m_nRunProd + m_nWinProd;
+		m_nRunDue = m_nRunDue + nDue;
+		m_nRunUnderruns = m_nRunUnderruns + m_nWinUnderruns;
+		m_nRunPcmCyc = m_nRunPcmCyc + nPCMCyc;
+		m_nRunMixCyc = m_nRunMixCyc + nMixCyc;
+		m_nRunStepCyc = m_nRunStepCyc + nStepCyc;
+		m_nRunLockCyc = m_nRunLockCyc + nLockCyc;
+		m_nRunLockWaits = m_nRunLockWaits + nLockWaits;
+		m_nRunLockCont = m_nRunLockCont + nLockCont;
+		m_nRunSteps = m_nRunSteps + m_nWinSteps;
+		m_nRunTicks = m_nRunTicks + nTicks;
+		for (int i = 0; i < 4; ++i)
+		{
+			m_nRunC2Ev[i] = m_nRunC2Ev[i] + nC2Ev[i];
+			m_nRunC3Ev[i] = m_nRunC3Ev[i] + nC3Ev[i];
+		}
 	}
 
-	LogLine("win n=%u song=%s done=%u paused=%u chunks=%llu due=%llu prod=%llu short=%llu pct=%llu underruns=%llu core2_pct=%llu core3_pct=%llu resample_us=%llu tick_waits=%llu tick_us=%llu lookahead_waits=%llu lookahead_us=%llu rpc_waits=%llu rpc_us=%llu max_lag=%llu write_hw=%llu irq_hw=%llu write_ovf=%llu irq_ovf=%llu ring_drops=%llu devq_maxavail=%llu devq_low=%llu sound_restarts=%llu sound_drops=%llu lock_us=%llu lock_waits=%llu mcu_us=%llu var=%d pcm_cyc=%llu mix_cyc=%llu step_cyc=%llu lock_cyc=%llu",
+	LogLine("win n=%u song=%s done=%u paused=%u chunks=%llu due=%llu prod=%llu short=%llu pct=%llu underruns=%llu core2_pct=%llu core3_pct=%llu resample_us=%llu tick_waits=%llu tick_us=%llu lookahead_waits=%llu lookahead_us=%llu rpc_waits=%llu rpc_us=%llu max_lag=%llu write_hw=%llu irq_hw=%llu write_ovf=%llu irq_ovf=%llu ring_drops=%llu devq_maxavail=%llu devq_low=%llu sound_restarts=%llu sound_drops=%llu lock_us=%llu lock_waits=%llu mcu_us=%llu var=%d pcm_cyc=%llu mix_cyc=%llu step_cyc=%llu lock_cyc=%llu steps=%llu ticks=%llu pubs=%llu lock_cont=%llu fifo_hw=%llu fifo_full=%llu irq0=%llu pcm=%d sync=%d timer=%d tchk=%s tchk_cmp=%llu tchk_mism=%llu tchk_first=%llu tchk_code=%u lazy_skips=%llu c2_inst=%llu c2_brmis=%llu c2_l1d=%llu c2_l2d=%llu c3_inst=%llu c3_brmis=%llu c3_l1d=%llu c3_l2d=%llu",
 	        m_nWinIndex,
 	        SongName(m_nCurrentSong),
 	        m_bSongDone ? 1 : 0,
@@ -852,7 +1024,29 @@ void CMinimalApp::WriteWindow(bool bPaused)
 	        static_cast<unsigned long long>(nPCMCyc),
 	        static_cast<unsigned long long>(nMixCyc),
 	        static_cast<unsigned long long>(nStepCyc),
-	        static_cast<unsigned long long>(nLockCyc));
+	        static_cast<unsigned long long>(nLockCyc),
+	        static_cast<unsigned long long>(m_nWinSteps),
+	        static_cast<unsigned long long>(nTicks),
+	        static_cast<unsigned long long>(nPubs),
+	        static_cast<unsigned long long>(nLockCont),
+	        static_cast<unsigned long long>(S.fifo_hw),
+	        static_cast<unsigned long long>(nFifoFull),
+	        static_cast<unsigned long long>(nIrq0),
+	        RunPcm(nVariant), RunSync(nVariant), RunTimer(nVariant),
+	        pTchk,
+	        static_cast<unsigned long long>(tchk.compares),
+	        static_cast<unsigned long long>(tchk.mismatches),
+	        static_cast<unsigned long long>(tchk.first_cycles),
+	        tchk.first_code,
+	        static_cast<unsigned long long>(tchk.lazy_skips),
+	        static_cast<unsigned long long>(nC2Ev[0]),
+	        static_cast<unsigned long long>(nC2Ev[1]),
+	        static_cast<unsigned long long>(nC2Ev[2]),
+	        static_cast<unsigned long long>(nC2Ev[3]),
+	        static_cast<unsigned long long>(nC3Ev[0]),
+	        static_cast<unsigned long long>(nC3Ev[1]),
+	        static_cast<unsigned long long>(nC3Ev[2]),
+	        static_cast<unsigned long long>(nC3Ev[3]));
 
 	m_nWinIndex = m_nWinIndex + 1;
 	ResetWindow();
@@ -861,7 +1055,7 @@ void CMinimalApp::WriteWindow(bool bPaused)
 void CMinimalApp::WriteSongEnd()
 {
 	const u64 nPct = m_nSongDue > 0 ? m_nSongProd * 100 / m_nSongDue : 100;
-	LogLine("song_end song=%s due=%llu prod=%llu short=%llu pct=%llu underruns=%llu completions=%llu cycles=%llu var=%d",
+	LogLine("song_end song=%s due=%llu prod=%llu short=%llu pct=%llu underruns=%llu completions=%llu cycles=%llu var=%d pcm=%d sync=%d timer=%d name=%s",
 	        SongName(m_nCurrentSong),
 	        static_cast<unsigned long long>(m_nSongDue),
 	        static_cast<unsigned long long>(m_nSongProd),
@@ -870,48 +1064,66 @@ void CMinimalApp::WriteSongEnd()
 	        static_cast<unsigned long long>(m_nSongUnderruns),
 	        static_cast<unsigned long long>(m_nCompletions),
 	        static_cast<unsigned long long>(m_nCycles),
-	        __atomic_load_n(&m_nCurrentVariant, __ATOMIC_ACQUIRE));
+	        __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE),
+	        RunPcm(__atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE)),
+	        RunSync(__atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE)),
+	        RunTimer(__atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE)),
+	        RunName(__atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE)));
+}
+
+void CMinimalApp::WriteRunTotal()
+{
+	// Core 2 only, from DrainMailboxes after the song_end + window
+	// flush, so every song window of this run is included. The two
+	// derived ratios are THE comparators across runs: cyc_per_step =
+	// core-2 MCU stepping cycles per MCU step (excludes lock spins),
+	// cyc_per_tick = core-3 PCM task cycles per PCM tick. pct is the
+	// real-time rate; both ratios still move when pct saturates at
+	// 100, which is what makes them useful once a run is fast enough.
+	const int nRun = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
+	const u64 nPct = m_nRunDue > 0 ? m_nRunProd * 100 / m_nRunDue : 100;
+	const u64 nCycPerStep = m_nRunSteps > 0 ? m_nRunStepCyc / m_nRunSteps : 0;
+	const u64 nCycPerTick = m_nRunTicks > 0 ? m_nRunPcmCyc / m_nRunTicks : 0;
+	const u64 nLockCycPerStep1000 = m_nRunSteps > 0 ? m_nRunLockCyc * 1000 / m_nRunSteps : 0;
+	const TimerCheckStatus tchk = TIMER_GetCheckStatus(*m_pEmulator->GetMCU().timer);
+	LogLine("run_total n=%d name=%s pcm=%d sync=%d timer=%d due=%llu prod=%llu pct=%llu underruns=%llu steps=%llu ticks=%llu step_cyc=%llu lock_cyc=%llu pcm_cyc=%llu mix_cyc=%llu cyc_per_step=%llu lock_cyc_per_kstep=%llu cyc_per_tick=%llu lock_waits=%llu lock_cont=%llu c2_inst=%llu c2_brmis=%llu c2_l1d=%llu c2_l2d=%llu c3_inst=%llu c3_brmis=%llu c3_l1d=%llu c3_l2d=%llu tchk=%s tchk_cmp=%llu tchk_mism=%llu tchk_first=%llu tchk_code=%u",
+	        nRun, RunName(nRun), RunPcm(nRun), RunSync(nRun), RunTimer(nRun),
+	        static_cast<unsigned long long>(m_nRunDue),
+	        static_cast<unsigned long long>(m_nRunProd),
+	        static_cast<unsigned long long>(nPct),
+	        static_cast<unsigned long long>(m_nRunUnderruns),
+	        static_cast<unsigned long long>(m_nRunSteps),
+	        static_cast<unsigned long long>(m_nRunTicks),
+	        static_cast<unsigned long long>(m_nRunStepCyc),
+	        static_cast<unsigned long long>(m_nRunLockCyc),
+	        static_cast<unsigned long long>(m_nRunPcmCyc),
+	        static_cast<unsigned long long>(m_nRunMixCyc),
+	        static_cast<unsigned long long>(nCycPerStep),
+	        static_cast<unsigned long long>(nLockCycPerStep1000),
+	        static_cast<unsigned long long>(nCycPerTick),
+	        static_cast<unsigned long long>(m_nRunLockWaits),
+	        static_cast<unsigned long long>(m_nRunLockCont),
+	        static_cast<unsigned long long>(m_nRunC2Ev[0]),
+	        static_cast<unsigned long long>(m_nRunC2Ev[1]),
+	        static_cast<unsigned long long>(m_nRunC2Ev[2]),
+	        static_cast<unsigned long long>(m_nRunC2Ev[3]),
+	        static_cast<unsigned long long>(m_nRunC3Ev[0]),
+	        static_cast<unsigned long long>(m_nRunC3Ev[1]),
+	        static_cast<unsigned long long>(m_nRunC3Ev[2]),
+	        static_cast<unsigned long long>(m_nRunC3Ev[3]),
+	        tchk.active ? (tchk.mismatches == 0 ? "ok" : "FAIL") : "off",
+	        static_cast<unsigned long long>(tchk.compares),
+	        static_cast<unsigned long long>(tchk.mismatches),
+	        static_cast<unsigned long long>(tchk.first_cycles),
+	        tchk.first_code);
 }
 
 void CMinimalApp::WriteSequenceDone()
 {
-	// Core 2 only, direct from DrainMailboxes after variant 5's
-	// song_end + window flush (so the totals below are complete at
-	// this line). Per-variant totals across that variant's SONG
-	// windows only (idle windows after this line stop adding, so
-	// this line stays the authoritative totals). Compact field
-	// names (vN_*) keep the line inside LogLine's buffer.
-	LogLine("sequence_done v0_prod=%llu v0_pcm_cyc=%llu v0_mix_cyc=%llu v0_step_cyc=%llu v0_lock_cyc=%llu v1_prod=%llu v1_pcm_cyc=%llu v1_mix_cyc=%llu v1_step_cyc=%llu v1_lock_cyc=%llu v2_prod=%llu v2_pcm_cyc=%llu v2_mix_cyc=%llu v2_step_cyc=%llu v2_lock_cyc=%llu v3_prod=%llu v3_pcm_cyc=%llu v3_mix_cyc=%llu v3_step_cyc=%llu v3_lock_cyc=%llu v4_prod=%llu v4_pcm_cyc=%llu v4_mix_cyc=%llu v4_step_cyc=%llu v4_lock_cyc=%llu v5_prod=%llu v5_pcm_cyc=%llu v5_mix_cyc=%llu v5_step_cyc=%llu v5_lock_cyc=%llu",
-	        static_cast<unsigned long long>(m_nVarProd[0]),
-	        static_cast<unsigned long long>(m_nVarPcmCyc[0]),
-	        static_cast<unsigned long long>(m_nVarMixCyc[0]),
-	        static_cast<unsigned long long>(m_nVarStepCyc[0]),
-	        static_cast<unsigned long long>(m_nVarLockCyc[0]),
-	        static_cast<unsigned long long>(m_nVarProd[1]),
-	        static_cast<unsigned long long>(m_nVarPcmCyc[1]),
-	        static_cast<unsigned long long>(m_nVarMixCyc[1]),
-	        static_cast<unsigned long long>(m_nVarStepCyc[1]),
-	        static_cast<unsigned long long>(m_nVarLockCyc[1]),
-	        static_cast<unsigned long long>(m_nVarProd[2]),
-	        static_cast<unsigned long long>(m_nVarPcmCyc[2]),
-	        static_cast<unsigned long long>(m_nVarMixCyc[2]),
-	        static_cast<unsigned long long>(m_nVarStepCyc[2]),
-	        static_cast<unsigned long long>(m_nVarLockCyc[2]),
-	        static_cast<unsigned long long>(m_nVarProd[3]),
-	        static_cast<unsigned long long>(m_nVarPcmCyc[3]),
-	        static_cast<unsigned long long>(m_nVarMixCyc[3]),
-	        static_cast<unsigned long long>(m_nVarStepCyc[3]),
-	        static_cast<unsigned long long>(m_nVarLockCyc[3]),
-	        static_cast<unsigned long long>(m_nVarProd[4]),
-	        static_cast<unsigned long long>(m_nVarPcmCyc[4]),
-	        static_cast<unsigned long long>(m_nVarMixCyc[4]),
-	        static_cast<unsigned long long>(m_nVarStepCyc[4]),
-	        static_cast<unsigned long long>(m_nVarLockCyc[4]),
-	        static_cast<unsigned long long>(m_nVarProd[5]),
-	        static_cast<unsigned long long>(m_nVarPcmCyc[5]),
-	        static_cast<unsigned long long>(m_nVarMixCyc[5]),
-	        static_cast<unsigned long long>(m_nVarStepCyc[5]),
-	        static_cast<unsigned long long>(m_nVarLockCyc[5]));
+	// Core 2 only, after the last run's song_end + run_total. The
+	// per-run totals live in the run_total lines (one per run); this
+	// line is the terminal marker.
+	LogLine("sequence_done runs=%d", g_runCount);
 }
 
 void CMinimalApp::PCMTaskIteration()
@@ -947,6 +1159,11 @@ void CMinimalApp::PCMTaskIteration()
 	const uint64_t nPublished = __atomic_load_n(&S.cycles_pub, __ATOMIC_ACQUIRE);
 	if (nPublished <= PCM.cycles + ThreadSplitStateCircle::MaxTickCycles)
 	{
+		// Idle. Round 3: back off per profile before the next poll
+		// (0 = the legacy tight spin), so an idle core 3 does not
+		// hammer the line core 2 publishes on.
+		for (unsigned i = S.sync.core3_backoff; i > 0; --i)
+			MiniPause();
 		MiniPause();
 		return;
 	}
@@ -965,15 +1182,27 @@ void CMinimalApp::PCMTaskIteration()
 	if (nBatchEnd > nCap)
 		nBatchEnd = nCap;
 	// Variant dispatch (read at batch start): the variant changes
-	// ONLY while the PCM task is parked (inside DoVariantAdvance),
+	// ONLY while the PCM task is parked (inside DoRunAdvance),
 	// so the batch always runs one variant. Baseline keeps the
 	// plain PCM_Update name (its single-threaded callers are
 	// untouched); the variants are separate implementations over
 	// the same shared pcm_t.
-	const int nVariant = __atomic_load_n(&m_nCurrentVariant, __ATOMIC_ACQUIRE);
-	S.state_lock.Acquire();
-	PCM_Update_Variant(PCM, nBatchEnd, nVariant);
-	S.state_lock.Release();
+	const int nRun = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
+	const int nPcmVariant = RunPcm(nRun);
+	// Round 3: the lock follows the profile (BATCH/TICK hold it for
+	// the batch, FREE/FIFO take none), and the 4 PMU event counters
+	// are sampled around the batch (work only, not the idle spin).
+	u32 ev0[4], ev1[4];
+	PMU_ReadEvents(ev0);
+	const bool bLock = S.Core3LocksBatch();
+	if (bLock)
+		S.Core3Acquire();
+	PCM_Update_Variant(PCM, nBatchEnd, nPcmVariant);
+	if (bLock)
+		S.Core3Release();
+	PMU_ReadEvents(ev1);
+	for (int i = 0; i < 4; ++i)
+		S.c3_ev[i] = S.c3_ev[i] + static_cast<u32>(ev1[i] - ev0[i]);
 
 	// Publish the render position (stats only now) and the peak lag
 	// for the stats lines. Published only grows, and the batch never
@@ -1030,19 +1259,48 @@ void CMinimalApp::StepUntilFill(size_t nNeed, u64* pStepUs)
 	// publishing before it is safe.
 	mcu_t& MCU = m_pEmulator->GetMCU();
 	ThreadSplitStateCircle& S = *m_pSplitState;
+	const SplitSyncProfile& P = S.sync;
 	const u64 nStartUs = CTimer::GetClockTicks();
 	const uint64_t nStepStartCyc = PMU_ReadCycles();
 	u64 nSteps = 0;
 	const u64 nStepBudget = static_cast<u64>(nNeed + 2) * StepsPerFrameBudget;
 
-	while (m_Ring.Avail() < nNeed && nSteps < nStepBudget)
+	// Round 3 knobs (all 1/legacy in profile 0, which makes this loop
+	// exactly the shaped-var loop): publish cycles_pub every
+	// publish_interval steps (see split_thread_circle.h for why any
+	// interval <= 66 is safe; the table uses <= 32), check the ring
+	// every ring_check_interval steps (one ACQUIRE load of a line
+	// core 3 writes per sample -- checking more often than once per
+	// ~66 steps cannot observe a new frame anyway), and fold core 3's
+	// IRQ0 flag at the top of each step when the profile routes IRQ0
+	// through the flag.
+	const unsigned nPubInterval = P.publish_interval ? P.publish_interval : 1;
+	const unsigned nRingInterval = P.ring_check_interval ? P.ring_check_interval : 1;
+	unsigned nPubCountdown = nPubInterval;
+	unsigned nRingCountdown = 1;
+	const bool bFoldIrq = (P.legacy_irq == 0);
+	u64 nPublishes = 0;
+
+	while (nSteps < nStepBudget)
 	{
+		if (--nRingCountdown == 0)
+		{
+			if (m_Ring.Avail() >= nNeed)
+				break;
+			nRingCountdown = nRingInterval;
+		}
+		if (bFoldIrq)
+			SplitFoldIrq0(S, MCU);
 		PostDueEvents();
 		m_pEmulator->StepMCU();
-		// RELEASE publish: one instruction per StepMCU (cycles += 12),
-		// so this is per-instruction publish, exactly Sterr1's
-		// granularity.
-		__atomic_store_n(&S.cycles_pub, (uint64_t)MCU.cycles, __ATOMIC_RELEASE);
+		// RELEASE publish (every step in the legacy profile = Sterr1's
+		// per-instruction granularity; every N steps otherwise).
+		if (--nPubCountdown == 0)
+		{
+			__atomic_store_n(&S.cycles_pub, (uint64_t)MCU.cycles, __ATOMIC_RELEASE);
+			nPubCountdown = nPubInterval;
+			nPublishes = nPublishes + 1;
+		}
 		m_pEmulator->StepPeripherals();
 		nSteps = nSteps + 1;
 
@@ -1058,6 +1316,17 @@ void CMinimalApp::StepUntilFill(size_t nNeed, u64* pStepUs)
 		}
 	}
 
+	// Flush: publish the final position once more so core 3 never
+	// waits for the next chunk's loop to see the last < N steps.
+	if (nPubCountdown != nPubInterval)
+	{
+		__atomic_store_n(&S.cycles_pub, (uint64_t)MCU.cycles, __ATOMIC_RELEASE);
+		nPublishes = nPublishes + 1;
+	}
+	S.publishes = S.publishes + nPublishes;
+	m_nWinSteps = m_nWinSteps + nSteps;
+	SampleCore2Events();
+
 	if (pStepUs)
 		*pStepUs = CTimer::GetClockTicks() - nStartUs;
 	// PMU: raw step-loop wall cycles in this call (core 2's own
@@ -1068,6 +1337,21 @@ void CMinimalApp::StepUntilFill(size_t nNeed, u64* pStepUs)
 	// field to 0 anyway.
 	m_nWinStepWallCyc = m_nWinStepWallCyc + (PMU_ReadCycles() - nStepStartCyc);
 	m_nWinStepCalls = m_nWinStepCalls + 1;
+}
+
+void CMinimalApp::SampleCore2Events()
+{
+	// Core 2 only. 32-bit counters, sampled once per step-loop call
+	// (~5 ms, far below the ~4 s wrap), accumulated as deltas. Covers
+	// the whole step loop (MCU work + peripherals + lock spins), which
+	// is the core-2 IPC the analysis wants.
+	u32 nNow[4];
+	PMU_ReadEvents(nNow);
+	for (int i = 0; i < 4; ++i)
+	{
+		m_nWinC2Ev[i] = m_nWinC2Ev[i] + static_cast<u32>(nNow[i] - m_nC2EvLast[i]);
+		m_nC2EvLast[i] = nNow[i];
+	}
 }
 
 size_t CMinimalApp::ResampleChunk(float* pOut, size_t nFrames, size_t* pSilence)
@@ -1141,7 +1425,7 @@ size_t CMinimalApp::ResampleChunk(float* pOut, size_t nFrames, size_t* pSilence)
 	return nDone;
 }
 
-void CMinimalApp::DoVariantAdvance()
+void CMinimalApp::DoRunAdvance()
 {
 	// Core 2 only, called from DrainMailboxes (the chunk epilogue,
 	// after WriteSongEnd + the window flush) -- never mid-step.
@@ -1170,9 +1454,9 @@ void CMinimalApp::DoVariantAdvance()
 		StopSplitPCM();
 	m_pEmulator->Reset();
 	m_pEmulator->PostSystemReset(EMU_SystemReset::GS_RESET);
-	const int nOld = __atomic_load_n(&m_nCurrentVariant, __ATOMIC_ACQUIRE);
+	const int nOld = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
 	const int nNew = nOld + 1;
-	__atomic_store_n(&m_nCurrentVariant, nNew, __ATOMIC_RELEASE);
+	__atomic_store_n(&m_nCurrentRun, nNew, __ATOMIC_RELEASE);
 	SplitDMB();
 	InitSplitState(true);
 
@@ -1193,9 +1477,30 @@ void CMinimalApp::DoVariantAdvance()
 	m_nSongProd = 0;
 	m_nSongShort = 0;
 	m_nSongUnderruns = 0;
+	m_nRunProd = 0;
+	m_nRunDue = 0;
+	m_nRunUnderruns = 0;
+	m_nRunPcmCyc = 0;
+	m_nRunMixCyc = 0;
+	m_nRunStepCyc = 0;
+	m_nRunLockCyc = 0;
+	m_nRunLockWaits = 0;
+	m_nRunLockCont = 0;
+	m_nRunSteps = 0;
+	m_nRunTicks = 0;
+	for (int i = 0; i < 4; ++i)
+	{
+		m_nRunC2Ev[i] = 0;
+		m_nRunC3Ev[i] = 0;
+	}
+	// The core-2 event counters keep counting across the reset; resync
+	// the last-read values so the first window of the new run does not
+	// inherit the reset's instructions.
+	PMU_ReadEvents(m_nC2EvLast);
 	ResetWindow();
 
-	LogLine("variant n=%d from=%d to=%d name=%s", nNew, nOld, nNew, VariantName(nNew));
+	LogLine("run n=%d from=%d to=%d name=%s pcm=%d sync=%d timer=%d sync_name=%s", nNew, nOld, nNew, RunName(nNew),
+	        RunPcm(nNew), RunSync(nNew), RunTimer(nNew), SyncProfile(RunSync(nNew)).short_name);
 }
 
 void CMinimalApp::DrainMailboxes()
@@ -1222,10 +1527,11 @@ void CMinimalApp::DrainMailboxes()
 			WriteWindow(false);
 		else
 			ResetWindow();
-		const int nVariant = __atomic_load_n(&m_nCurrentVariant, __ATOMIC_ACQUIRE);
-		if (nVariant < g_pcmVariantCount - 1)
+		WriteRunTotal();	// this run's totals (one line per run; survives a power cut later on)
+		const int nVariant = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
+		if (nVariant < g_runCount - 1)
 		{
-			DoVariantAdvance();	// logs the variant line; E1M1 restarts
+			DoRunAdvance();	// logs the run line; E1M1 restarts
 		}
 		else if (!m_bSequenceDone)
 		{
@@ -1309,69 +1615,52 @@ void CMinimalApp::IdleLoop()
 // characters render as blanks.
 static const u8* VariantFontGlyph(char ch)
 {
-	static const u8 GlyphSpace[5] = {0x00, 0x00, 0x00, 0x00, 0x00};
-	static const u8 GlyphV[5] = {0x0F, 0x10, 0x20, 0x10, 0x0F};
-	static const u8 GlyphA[5] = {0x7E, 0x11, 0x11, 0x11, 0x7E};
-	static const u8 GlyphR[5] = {0x7F, 0x09, 0x19, 0x29, 0x46};
-	static const u8 Glyph0[5] = {0x3E, 0x51, 0x49, 0x45, 0x3E};
-	static const u8 Glyph1[5] = {0x00, 0x42, 0x7F, 0x40, 0x00};
-	static const u8 Glyph2[5] = {0x42, 0x61, 0x51, 0x49, 0x46};
-	static const u8 Glyph3[5] = {0x21, 0x41, 0x45, 0x4B, 0x31};
-	static const u8 Glyph_b[5] = {0x7F, 0x44, 0x44, 0x38, 0x00};
-	static const u8 Glyph_a[5] = {0x20, 0x54, 0x54, 0x5C, 0x28};
-	static const u8 Glyph_s[5] = {0x48, 0x54, 0x54, 0x54, 0x24};
-	static const u8 Glyph_e[5] = {0x38, 0x54, 0x54, 0x5C, 0x18};
-	static const u8 Glyph_l[5] = {0x00, 0x41, 0x7F, 0x40, 0x00};
-	static const u8 Glyph_i[5] = {0x00, 0x44, 0x7D, 0x40, 0x00};
-	static const u8 Glyph_n[5] = {0x7C, 0x04, 0x04, 0x78, 0x00};
-	static const u8 Glyph_c[5] = {0x38, 0x44, 0x44, 0x44, 0x00};
-	static const u8 Glyph_h[5] = {0x7F, 0x04, 0x04, 0x78, 0x00};
-	static const u8 Glyph_d[5] = {0x38, 0x44, 0x44, 0x44, 0x7F};
-	static const u8 Glyph_p[5] = {0x7C, 0x24, 0x24, 0x18, 0x00};
-	static const u8 Glyph_o[5] = {0x38, 0x44, 0x44, 0x44, 0x38};
-	switch (ch)
+	// Classic 5x7 column font (LSB = top row) for every character the
+	// run names use ("VAR nn name": digits, lowercase, a few capitals).
+	// Unknown characters render as blanks.
+	struct TGlyph { char ch; u8 col[5]; };
+	static const TGlyph Glyphs[] = {
+		{' ', {0x00, 0x00, 0x00, 0x00, 0x00}},
+		{'V', {0x1F, 0x20, 0x40, 0x20, 0x1F}},
+		{'A', {0x7E, 0x11, 0x11, 0x11, 0x7E}},
+		{'R', {0x7F, 0x09, 0x19, 0x29, 0x46}},
+		{'0', {0x3E, 0x51, 0x49, 0x45, 0x3E}},
+		{'1', {0x00, 0x42, 0x7F, 0x40, 0x00}},
+		{'2', {0x42, 0x61, 0x51, 0x49, 0x46}},
+		{'3', {0x21, 0x41, 0x45, 0x4B, 0x31}},
+		{'4', {0x18, 0x14, 0x12, 0x7F, 0x10}},
+		{'5', {0x27, 0x45, 0x45, 0x45, 0x39}},
+		{'6', {0x3C, 0x4A, 0x49, 0x49, 0x30}},
+		{'7', {0x01, 0x71, 0x09, 0x05, 0x03}},
+		{'8', {0x36, 0x49, 0x49, 0x49, 0x36}},
+		{'9', {0x06, 0x49, 0x49, 0x29, 0x1E}},
+		{'a', {0x20, 0x54, 0x54, 0x54, 0x78}},
+		{'b', {0x7F, 0x48, 0x44, 0x44, 0x38}},
+		{'c', {0x38, 0x44, 0x44, 0x44, 0x20}},
+		{'d', {0x38, 0x44, 0x44, 0x48, 0x7F}},
+		{'e', {0x38, 0x54, 0x54, 0x54, 0x18}},
+		{'f', {0x08, 0x7E, 0x09, 0x01, 0x02}},
+		{'h', {0x7F, 0x08, 0x04, 0x04, 0x78}},
+		{'i', {0x00, 0x44, 0x7D, 0x40, 0x00}},
+		{'k', {0x7F, 0x10, 0x28, 0x44, 0x00}},
+		{'l', {0x00, 0x41, 0x7F, 0x40, 0x00}},
+		{'m', {0x7C, 0x04, 0x18, 0x04, 0x78}},
+		{'n', {0x7C, 0x08, 0x04, 0x04, 0x78}},
+		{'o', {0x38, 0x44, 0x44, 0x44, 0x38}},
+		{'p', {0x7C, 0x14, 0x14, 0x14, 0x08}},
+		{'r', {0x7C, 0x08, 0x04, 0x04, 0x08}},
+		{'s', {0x48, 0x54, 0x54, 0x54, 0x20}},
+		{'t', {0x04, 0x3F, 0x44, 0x40, 0x20}},
+		{'u', {0x3C, 0x40, 0x40, 0x20, 0x7C}},
+		{'y', {0x0C, 0x50, 0x50, 0x50, 0x3C}},
+		{'z', {0x44, 0x64, 0x54, 0x4C, 0x44}},
+	};
+	for (const TGlyph& g : Glyphs)
 	{
-	case 'V':
-		return GlyphV;
-	case 'A':
-		return GlyphA;
-	case 'R':
-		return GlyphR;
-	case '0':
-		return Glyph0;
-	case '1':
-		return Glyph1;
-	case '2':
-		return Glyph2;
-	case '3':
-		return Glyph3;
-	case 'b':
-		return Glyph_b;
-	case 'a':
-		return Glyph_a;
-	case 's':
-		return Glyph_s;
-	case 'e':
-		return Glyph_e;
-	case 'l':
-		return Glyph_l;
-	case 'i':
-		return Glyph_i;
-	case 'n':
-		return Glyph_n;
-	case 'c':
-		return Glyph_c;
-	case 'h':
-		return Glyph_h;
-	case 'd':
-		return Glyph_d;
-	case 'p':
-		return Glyph_p;
-	case 'o':
-		return Glyph_o;
-	default:
-		return GlyphSpace;
+		if (g.ch == ch)
+			return g.col;
 	}
+	return Glyphs[0].col;
 }
 
 void CMinimalApp::DrawVariantLCD(int nVariant)
@@ -1391,7 +1680,7 @@ void CMinimalApp::DrawVariantLCD(int nVariant)
 	// (self-healing if the display reset); ~30 ms of core-1 I2C per
 	// draw, once per variant change + init.
 	char Text[16];
-	snprintf(Text, sizeof(Text), "VAR %d %s", nVariant, VariantName(nVariant));
+	snprintf(Text, sizeof(Text), "VAR %d %s", nVariant, RunName(nVariant));
 	static const u8 Init[] = {
 		0x00,	// control: commands follow
 		0xAE,	// display off
@@ -1451,7 +1740,7 @@ void CMinimalApp::MisterLoop()
 	// sfindex; Mute gets its own type but counts as link-active,
 	// exactly like mt32-pi's Mute path) and re-sends the variant
 	// status (correct the MiSTer back to reality). A variant
-	// advance (core 2, DoVariantAdvance) is picked up by POLLING:
+	// advance (core 2, DoRunAdvance) is picked up by POLLING:
 	// each poll, if the committed variant differs from the last
 	// sent one while the link is active, re-send the status + LCD
 	// (<= 10 ms after the advance; a failed send retries next poll
@@ -1482,7 +1771,7 @@ void CMinimalApp::MisterLoop()
 			// (When the link is down this is skipped: the init path
 			// below sends the CURRENT variant when the link comes
 			// back up, so no advance is ever missed.)
-			const int nPollVariant = __atomic_load_n(&m_nCurrentVariant, __ATOMIC_ACQUIRE);
+			const int nPollVariant = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
 			if (bActive && nPollVariant != nLastSentVariant)
 			{
 				const u8 VariantStatus[3] = {MisterSynthVariant, 0xFF, static_cast<u8>(nPollVariant)};
@@ -1519,7 +1808,7 @@ void CMinimalApp::MisterLoop()
 					// status carries the CURRENT variant (the link
 					// may have come up mid-sequence, so variant 0
 					// must NOT be assumed here).
-					const int nInitVariant = __atomic_load_n(&m_nCurrentVariant, __ATOMIC_ACQUIRE);
+					const int nInitVariant = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
 					const u8 InitStatus[3] = {MisterSynthVariant, 0xFF, static_cast<u8>(nInitVariant)};
 					const int nWritten = m_pI2CMaster->Write(MisterI2CAddress, InitStatus, sizeof(InitStatus));
 					if (nWritten == 3)
@@ -1573,7 +1862,7 @@ void CMinimalApp::MisterLoop()
 					// above owns variant-change sends (it re-sends
 					// promptly if this writeback's variant differs
 					// from the last sent one).
-					const int nChangeVariant = __atomic_load_n(&m_nCurrentVariant, __ATOMIC_ACQUIRE);
+					const int nChangeVariant = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
 					const u8 ChangeStatus[3] = {MisterSynthVariant, 0xFF, static_cast<u8>(nChangeVariant)};
 					const int nWritten = m_pI2CMaster->Write(MisterI2CAddress, ChangeStatus, sizeof(ChangeStatus));
 					if (nWritten != 3)
@@ -1687,6 +1976,9 @@ void CMinimalApp::AudioLoop()
 	// the kernel runs degraded, never hung).
 	PMU_Enable();
 	m_bPmu2Ok = PMU_Validate();
+	PMU_EnableEvents();
+	m_bPmuEv2Ok = PMU_ValidateEvents();
+	PMU_ReadEvents(m_nC2EvLast);
 	if (m_pSplitState)
 		m_pSplitState->nop_cyc2 = PMU_CalibrateNop();
 	SplitDMB();
@@ -1695,7 +1987,7 @@ void CMinimalApp::AudioLoop()
 		MiniPause();
 	SplitDMB();
 	const bool bPmu3Ok = m_bPmu3Done && m_bPmu3Ok;
-	LogLine("boot kernel=mt32-shaped-var2 split=on song=%s rate=%u out_rate=%u out_chunk=%u devq=%u romset=%s audio=i2s pmc2=%s pmc3=%s seq=auto variants=0:baseline,1:sched,2:pipe,3:neon2,4:splitacc,5:layout",
+	LogLine("boot kernel=mt32-shaped-var3 split=on song=%s rate=%u out_rate=%u out_chunk=%u devq=%u romset=%s audio=i2s pmc2=%s pmc3=%s pmev2=%s pmev3=%s timer_selftest=%s selftest_plain_mism=%llu selftest_inject_mism=%llu seq=auto runs=%d pcm_variants=%d",
 	        SongName(m_nCurrentSong),
 	        m_nNativeRate,
 	        OutRate,
@@ -1703,7 +1995,23 @@ void CMinimalApp::AudioLoop()
 	        DeviceQueueFrames,
 	        m_pRomsetName != nullptr ? m_pRomsetName : "unknown",
 	        m_bPmu2Ok ? "ok" : "fail",
-	        bPmu3Ok ? "ok" : "fail");
+	        bPmu3Ok ? "ok" : "fail",
+	        m_bPmuEv2Ok ? "ok" : "fail",
+	        (m_bPmu3Done && m_bPmuEv3Ok) ? "ok" : "fail",
+	        m_bTimerSelfTestPass ? "pass" : "FAIL",
+	        static_cast<unsigned long long>(m_nTimerSelfTestPlain),
+	        static_cast<unsigned long long>(m_nTimerSelfTestInject),
+	        g_runCount, g_pcmVariantCount);
+	for (int i = 0; i < g_runCount; ++i)
+	{
+		const SplitSyncProfile& P = SyncProfile(g_runs[i].sync);
+		LogLine("runlist n=%d name=%s pcm=%d pcm_name=%s sync=%d sync_name=%s lock_mode=%u legacy_lock=%u legacy_timing=%u legacy_irq=%u publish_interval=%u ring_check_interval=%u core3_backoff=%u timer=%d",
+		        i, g_runs[i].name, g_runs[i].pcm,
+		        (g_runs[i].pcm >= 0 && g_runs[i].pcm < g_pcmVariantCount) ? g_pcmVariants[g_runs[i].pcm].short_name : "?",
+		        P.number, P.short_name, P.lock_mode, P.legacy_lock, P.legacy_timing, P.legacy_irq,
+		        P.publish_interval, P.ring_check_interval, P.core3_backoff, g_runs[i].timer);
+	}
+	LogLine("legend r3: var = RUN index (see runlist; pcm/sync/timer fields give the run's components); steps = MCU steps in the window, ticks = PCM ticks rendered; step_cyc/steps = core-2 cycles per MCU step (THE core-2 comparator; excludes lock spins), pcm_cyc/ticks = core-3 cycles per PCM tick (THE core-3 comparator); pubs = cycles_pub publishes; lock_cont = lock ops whose first try failed (round-3 timing only); fifo_hw = deferred-store FIFO high water (FIFO modes), fifo_full = pushes that waited (must be 0); irq0 = voice-end IRQs folded via the flag; tchk = lazy-timer check (off when the run's timer mode is not CHECK; FAIL = any mismatch; tchk_first = mcu cycles of the first mismatch, tchk_code per mcu_timer.h), lazy_skips = TIMER_Clock fast-path returns; c2_*/c3_* = PMU events per core over the window's work (inst = instructions retired, brmis = branch mispredicts, l1d/l2d = data cache refills); run_total lines carry the per-run sums + cyc_per_step/cyc_per_tick; sequence_done is the terminal marker. Boot: pmev2/pmev3 validate the event counters (fail -> those fields read 0); timer_selftest=pass requires the plain lazy-vs-legacy self-test to report 0 mismatches AND the fault-injected run to report > 0 (proves the detector sees a one-tick event shift).");
 	LogLine("legend win: due is wall-clock (elapsed*48000); pct = prod*100/due; window 0 excludes the 2 startup chunks (512 frames) so it reads ~99.8%% on a perfect run -- judge sustained windows; tick/lookahead/rpc waits+us, write_hw/irq_hw, write_ovf/irq_ovf are 0 (machinery removed); max_lag is the peak published-minus-rendered lag since (re)activation; ring_drops is the drop-oldest total since boot (inherited wart: togglefix showed 15832 at the toggle, then flat -- mechanism unpinned, reported not hidden); core2_pct is the step-loop wall share; resample_us is the resampler wall time; devq_maxavail is peak device FREE space (near 2048 = device nearly starved; CORRECTED vs old shaped, which measured queued); devq_low counts chunks with <1 chunk QUEUED at Write time; sound_drops must be 0 by construction (corrected free-space wait); sustained pct ~80-85 is the ENGINE ceiling (togglefix: ~85%% real-time), not a failure -- pct=100 needs a real-time engine; DIAG fields: lock_us = core-2 state-lock spin-wait wall in the window, lock_waits = lock ops taken, mcu_us = step-loop wall minus lock_us (pure MCU stepping + peripherals); PMU fields: var = variant this window ran under (0 baseline, 1 sched, 2 pipe, 3 neon2, 4 splitacc, 5 layout); pcm_cyc = core-3 total PCM task cycles, mix_cyc = core-3 voice-mix cycles per batch, step_cyc = core-2 MCU stepping cycles only, lock_cyc = core-2 state-lock spin cycles; every cycle value is NOP-corrected (double-read cost subtracted, clamped at 0); a failed counter (boot pmc2/pmc3=fail) reports 0 for its fields -- the boot line is the validity signal");
 	LogLine("legend events: every control event is logged with t= timestamp + action -- variant (n/from/to/name on each advance), song_end (with var), sequence_done (per-variant totals vN_prod/vN_pcm_cyc/vN_mix_cyc/vN_step_cyc/vN_lock_cyc), mister_init/mister_down/mister_synth/mister_romset/mister_sfindex/mister_mute/mister_writefail, sound_drop/sound_restart/sound_start_fail, mister_drop. NO keys exist: no key lines, no cycle lines, no song_aborted lines (advances happen only on completed songs). The MIDI stream is NEVER logged. No OSD text is attempted (3-byte protocol has no text field); the MiSTer's own pop-ups on status change are unchanged; the variant NUMBER is the status soundfont byte {0xA2, 0xFF, variant} (documented minimal-kernel-only hack) and the variant NAME is the SSD1306 mirror at 0x3C (best-effort, core 1 only). Audio leaves via the Pi I2S output, NOT through the MiSTer. LED: core-2 heartbeat, ~1 Hz while windows clean, held Off on bad windows, frozen while paused or device-space stalled; LED-off is NEVER a done signal.");
 
@@ -1887,6 +2195,8 @@ void CMinimalApp::PCMLoop()
 	// proceed.
 	PMU_Enable();
 	m_bPmu3Ok = PMU_Validate();
+	PMU_EnableEvents();
+	m_bPmuEv3Ok = PMU_ValidateEvents();
 	if (m_pSplitState)
 		m_pSplitState->nop_cyc3 = PMU_CalibrateNop();
 	SplitDMB();
@@ -2032,7 +2342,23 @@ bool CMinimalApp::Initialize()
 	m_pRomsetInfo->PurgeRomData();
 	m_pEmulator->PostSystemReset(EMU_SystemReset::GS_RESET);
 
+	// Round 3: lazy-timer self-test (single-threaded, before any core
+	// starts). Plain run must report 0 mismatches; the fault-injected
+	// run (lazy jump skips one tick past an event = the round-1
+	// failure class) MUST report > 0, or the detector itself is
+	// broken. Both numbers go to the boot line. A FAIL does not stop
+	// the sequence (the runs still measure), but the lazy-timer runs
+	// are then not trustworthy and tchk must be read with that in mind.
+	m_nTimerSelfTestPlain = TIMER_SelfTest(true, 400000, false);
+	m_nTimerSelfTestInject = TIMER_SelfTest(true, 400000, true);
+	m_bTimerSelfTestPass = (m_nTimerSelfTestPlain == 0 && m_nTimerSelfTestInject > 0);
+	LogLine("timer_selftest result=%s plain_mism=%llu inject_mism=%llu steps=400000",
+	        m_bTimerSelfTestPass ? "pass" : "FAIL",
+	        static_cast<unsigned long long>(m_nTimerSelfTestPlain),
+	        static_cast<unsigned long long>(m_nTimerSelfTestInject));
+
 	// Split activation (MK1 only -- enforced by the romset match above).
+	// Run 0's sync profile + timer mode are installed inside.
 	InitSplitState(false);
 
 	// Song 0 (E1M1) starts automatically at boot with variant 0

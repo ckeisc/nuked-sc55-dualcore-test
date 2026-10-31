@@ -102,7 +102,7 @@ index f2728ca..7592ab9 100644
  
  void Dis_SCB_F(DisassembleDecoder& decoder, uint8_t byte, DisassembledInstruction& instr)
 diff --git a/src/backend/emu.cpp b/src/backend/emu.cpp
-index 976c02c..8a0b6d2 100644
+index 976c02c..8d9b633 100644
 --- a/src/backend/emu.cpp
 +++ b/src/backend/emu.cpp
 @@ -17,10 +17,12 @@
@@ -118,24 +118,20 @@ index 976c02c..8a0b6d2 100644
  #include "submcu.h"
  #include <bit>
  #include <fstream>
-@@ -159,11 +161,74 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
+@@ -159,11 +161,70 @@ void Emulator::PostSystemReset(EMU_SystemReset reset)
      }
  }
  
 +namespace
 +{
-+    NukedProfileClockFn g_nukedProfileClock = nullptr;
 +    NukedProfileData g_nukedProfile;
 +}
 +
++NukedProfileClockFn g_nukedProfileClockFn = nullptr;
++
 +void NukedProfileSetClock(NukedProfileClockFn pFn)
 +{
-+    g_nukedProfileClock = pFn;
-+}
-+
-+NukedProfileClockFn NukedProfileClock()
-+{
-+    return g_nukedProfileClock;
++    g_nukedProfileClockFn = pFn;
 +}
 +
 +NukedProfileData& NukedProfile()
@@ -1463,12 +1459,1055 @@ index 6737cd6..94846de 100644
  
  void MCU_ErrorTrap(mcu_t& mcu);
  
+diff --git a/src/backend/mcu_timer.cpp b/src/backend/mcu_timer.cpp
+index 4916ad5..65d20b7 100644
+--- a/src/backend/mcu_timer.cpp
++++ b/src/backend/mcu_timer.cpp
+@@ -16,6 +16,56 @@
+  * GNU General Public License for more details.
+  *
+  */
++
++/*
++ * mt32-pi round 3 (2026-10-31): event-driven ("lazy") TIMER_Clock.
++ *
++ * LEGACY semantics (unchanged, kept verbatim as ClockLegacy): for each
++ * timer, `while (deadline < T) { body; deadline += stride; }` with
++ * T = cycles / 2. One body = one timer tick. On MK1 the FRT stride is
++ * 4 and T advances 6 per MCU step, so TIMER_Clock runs ~1.5 FRT bodies
++ * per FRT per step plus the TMR: ~140 instructions per step, about a
++ * quarter of the MCU core's instruction stream (QEMU attribution,
++ * round 1).
++ *
++ * The body of one tick does exactly one of two things:
++ *  (a) an EVENT: the counter matches OCRA/OCRB (flags, optional CCLRA
++ *      reset) or wraps to 0 (overflow flag); or
++ *  (b) nothing but `++counter`.
++ * In addition, every tick re-issues MCU_Interrupt_SetRequest(src, 1)
++ * for each (enable bit set && flag set) pair. That re-issue is
++ * observable: MCU_Interrupt_Handle Excludes the source when it takes
++ * the interrupt and the next tick puts it back until the firmware
++ * clears the flag -- so a tick is only "nothing but ++counter" when
++ * no (enable && flag) pair is set.
++ *
++ * LAZY: from the current counter value the index of the first event
++ * tick is computable in O(1): ia = (ocra - frc) mod 2^16, ib likewise,
++ * iw = 0xffff - frc (the tick whose increment wraps), e = min(ia, ib,
++ * iw), or e = 0 when an (enable && flag) pair is set. Ticks 0..e-1 are
++ * pure increments, so n <= e due ticks are applied as frc += n,
++ * deadline += n*stride (one jump), and an event tick (e == 0) runs the
++ * ORIGINAL body. A timer whose next event tick is in the future
++ * needs no work at all until the target reaches
++ * attention = deadline + e*stride + 1 (the first T at which tick e is
++ * due), so TIMER_Clock returns after one compare against the minimum
++ * attention over all timers; the deferred increments are applied
++ * ("materialized") when the attention is reached, when the MCU reads
++ * or writes any register of that timer, or when the mode changes.
++ * Every observable value (register reads, flags, interrupt requests
++ * and their step) is therefore identical to LEGACY.
++ *
++ * Why round 1's closed form failed and this one is different: round 1
++ * skipped event-free ticks per call with per-call distance math that
++ * cost more than the 1-3 bodies it saved, and it had an unexplained
++ * one-tick event shift. This implementation never predicts an event
++ * tick -- it only ever SKIPS ticks that provably cannot be events, and
++ * always runs the original body for the event itself. The detector
++ * for the one-tick-shift class (CHECK mode + the boot self-test with
++ * fault injection) is part of the same file so the kernel can prove
++ * on the device that a shift WOULD be caught.
++ */
++
+ #include "mcu_timer.h"
+ #include "mcu.h"
+ #include <cstdint>
+@@ -90,12 +140,51 @@ constexpr uint64_t AlignForward(uint64_t value, uint64_t interval)
+     return (value + (interval - 1)) & (~(interval - 1));
+ }
+ 
++// These tables are indexed by the low CKSn bits of the TCR.
++constexpr FRT_Step_Table FRT_STEP_TABLE_GENERIC = {4, 8, 32, 2};
++constexpr FRT_Step_Table FRT_STEP_TABLE_MK1     = {4, 8, 32, 4};
++
++// A value of 0 means do not step.
++constexpr TMR_Step_Table TMR_STEP_TABLE_GENERIC = {0, 8, 64, 1024, 0, 2, 2, 2};
++constexpr TMR_Step_Table TMR_STEP_TABLE_MK1     = {0, 8, 64, 1024, 0, 4, 4, 4};
++
++// Every interrupt request a timer issues goes through here: to the
++// MCU, or to the sink word when one is installed (shadow/self-test).
++// Requests with value 1 are also recorded in req_mask for the CHECK
++// comparison (reset at the start of every TIMER_Clock call).
++static inline void TimerSetRequest(mcu_timer_t& timer, MCU_Interrupt_Source source, bool value)
++{
++    const uint32_t bit = 1u << static_cast<uint32_t>(source);
++    if (value)
++        timer.req_mask |= bit;
++    if (timer.req_sink)
++    {
++        if (value)
++            *timer.req_sink |= bit;
++        else
++            *timer.req_sink &= ~bit;
++        return;
++    }
++    MCU_Interrupt_SetRequest(*timer.mcu, source, value);
++}
++
++static void TIMER_SetTables(mcu_timer_t& timer, bool is_mk1)
++{
++    timer.frt_step_table = is_mk1 ? FRT_STEP_TABLE_MK1 : FRT_STEP_TABLE_GENERIC;
++    timer.tmr_step_table = is_mk1 ? TMR_STEP_TABLE_MK1 : TMR_STEP_TABLE_GENERIC;
++}
++
++static void FrtMaterialize(mcu_timer_t& timer, uint32_t i, uint64_t T);
++static void TmrMaterialize(mcu_timer_t& timer, uint64_t T);
++static void MaterializeAll(mcu_timer_t& timer, uint64_t T);
++static void CheckRecord(mcu_timer_t& timer, uint32_t code, uint64_t cycles);
++
+ void TIMER_Init(mcu_timer_t& timer, mcu_t& mcu)
+ {
+     timer.mcu = &mcu;
+ }
+ 
+-void TIMER_Reset(mcu_timer_t& timer)
++static void ResetRegisters(mcu_timer_t& timer)
+ {
+     for (int i = 0; i < 3; ++i)
+     {
+@@ -121,6 +210,19 @@ void TIMER_Reset(mcu_timer_t& timer)
+         .tcnt      = 0,
+         .status_rd = 0,
+     };
++    timer.next_attention = 0;
++    timer.req_mask       = 0;
++}
++
++void TIMER_Reset(mcu_timer_t& timer)
++{
++    ResetRegisters(timer);
++    if (timer.shadow)
++    {
++        ResetRegisters(*timer.shadow);
++        timer.shadow->cycles  = timer.cycles;
++        timer.shadow->tempreg = timer.tempreg;
++    }
+ }
+ 
+ void TIMER_WriteFRT(mcu_timer_t& timer, uint32_t address, uint8_t data)
+@@ -128,6 +230,18 @@ void TIMER_WriteFRT(mcu_timer_t& timer, uint32_t address, uint8_t data)
+     uint32_t t = (address >> 4) - 1;
+     if (t > 2)
+         return;
++    // CHECK: mirror the write into the shadow (its mode is LEGACY, so
++    // this cannot recurse). LAZY/CHECK: bring the timer up to date
++    // first, so the pending event-free ticks are applied under the
++    // OLD registers exactly as LEGACY would have done at the previous
++    // TIMER_Clock, then invalidate the attention point.
++    if (timer.shadow && timer.mode == TIMER_MODE_CHECK)
++        TIMER_WriteFRT(*timer.shadow, address, data);
++    if (timer.mode != TIMER_MODE_LEGACY)
++    {
++        FrtMaterialize(timer, t, timer.cycles);
++        timer.next_attention = 0;
++    }
+     frt_t& frt = timer.frt[t];
+ 
+     address &= 0x0f;
+@@ -150,19 +264,19 @@ void TIMER_WriteFRT(mcu_timer_t& timer, uint32_t address, uint8_t data)
+         {
+             frt.tcsr      &= ~FRT_TCSR_OVF;
+             frt.status_rd &= ~FRT_TCSR_OVF;
+-            MCU_Interrupt_SetRequest(*timer.mcu, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_FOVI + t * 4), 0);
++            TimerSetRequest(timer, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_FOVI + t * 4), 0);
+         }
+         if ((data & FRT_TCSR_OCFA) == 0 && (frt.status_rd & FRT_TCSR_OCFA) != 0)
+         {
+             frt.tcsr      &= ~FRT_TCSR_OCFA;
+             frt.status_rd &= ~FRT_TCSR_OCFA;
+-            MCU_Interrupt_SetRequest(*timer.mcu, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_OCIA + t * 4), 0);
++            TimerSetRequest(timer, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_OCIA + t * 4), 0);
+         }
+         if ((data & FRT_TCSR_OCFB) == 0 && (frt.status_rd & FRT_TCSR_OCFB) != 0)
+         {
+             frt.tcsr      &= ~FRT_TCSR_OCFB;
+             frt.status_rd &= ~FRT_TCSR_OCFB;
+-            MCU_Interrupt_SetRequest(*timer.mcu, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_OCIB + t * 4), 0);
++            TimerSetRequest(timer, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_OCIB + t * 4), 0);
+         }
+         break;
+     case REG_FRCH:
+@@ -186,11 +300,13 @@ void TIMER_WriteFRT(mcu_timer_t& timer, uint32_t address, uint8_t data)
+     }
+ }
+ 
+-uint8_t TIMER_ReadFRT(mcu_timer_t& timer, uint32_t address)
++static uint8_t ReadFRTRegisters(mcu_timer_t& timer, uint32_t address)
+ {
+     uint32_t t = (address >> 4) - 1;
+     if (t > 2)
+         return 0xff;
++    if (timer.mode != TIMER_MODE_LEGACY)
++        FrtMaterialize(timer, t, timer.cycles);
+     frt_t& frt = timer.frt[t];
+ 
+     address &= 0x0f;
+@@ -225,8 +341,28 @@ uint8_t TIMER_ReadFRT(mcu_timer_t& timer, uint32_t address)
+     return 0xff;
+ }
+ 
++uint8_t TIMER_ReadFRT(mcu_timer_t& timer, uint32_t address)
++{
++    const uint8_t ret = ReadFRTRegisters(timer, address);
++    if (timer.shadow && timer.mode == TIMER_MODE_CHECK)
++    {
++        const uint8_t shadow_ret = ReadFRTRegisters(*timer.shadow, address);
++        timer.check_compares++;
++        if (shadow_ret != ret)
++            CheckRecord(timer, TIMER_CHECK_READ_VALUE, timer.cycles * 2);
++    }
++    return ret;
++}
++
+ void TIMER_WriteTMR(mcu_timer_t& timer, uint32_t address, uint8_t data)
+ {
++    if (timer.shadow && timer.mode == TIMER_MODE_CHECK)
++        TIMER_WriteTMR(*timer.shadow, address, data);
++    if (timer.mode != TIMER_MODE_LEGACY)
++    {
++        TmrMaterialize(timer, timer.cycles);
++        timer.next_attention = 0;
++    }
+     tmr_t& tmr = timer.tmr;
+ 
+     switch (address)
+@@ -256,19 +392,19 @@ void TIMER_WriteTMR(mcu_timer_t& timer, uint32_t address, uint8_t data)
+         {
+             tmr.tcsr      &= ~TMR_TCSR_OVF;
+             tmr.status_rd &= ~TMR_TCSR_OVF;
+-            MCU_Interrupt_SetRequest(*timer.mcu, INTERRUPT_SOURCE_TIMER_OVI, 0);
++            TimerSetRequest(timer, INTERRUPT_SOURCE_TIMER_OVI, 0);
+         }
+         if ((data & TMR_TCSR_CMFA) == 0 && (tmr.status_rd & TMR_TCSR_CMFA) != 0)
+         {
+             tmr.tcsr      &= ~TMR_TCSR_CMFA;
+             tmr.status_rd &= ~TMR_TCSR_CMFA;
+-            MCU_Interrupt_SetRequest(*timer.mcu, INTERRUPT_SOURCE_TIMER_CMIA, 0);
++            TimerSetRequest(timer, INTERRUPT_SOURCE_TIMER_CMIA, 0);
+         }
+         if ((data & TMR_TCSR_CMFB) == 0 && (tmr.status_rd & TMR_TCSR_CMFB) != 0)
+         {
+             tmr.tcsr      &= ~TMR_TCSR_CMFB;
+             tmr.status_rd &= ~TMR_TCSR_CMFB;
+-            MCU_Interrupt_SetRequest(*timer.mcu, INTERRUPT_SOURCE_TIMER_CMIB, 0);
++            TimerSetRequest(timer, INTERRUPT_SOURCE_TIMER_CMIB, 0);
+         }
+         break;
+     case DEV_TMR_TCORA:
+@@ -283,8 +419,10 @@ void TIMER_WriteTMR(mcu_timer_t& timer, uint32_t address, uint8_t data)
+     }
+ }
+ 
+-uint8_t TIMER_ReadTMR(mcu_timer_t& timer, uint32_t address)
++static uint8_t ReadTMRRegisters(mcu_timer_t& timer, uint32_t address)
+ {
++    if (timer.mode != TIMER_MODE_LEGACY)
++        TmrMaterialize(timer, timer.cycles);
+     tmr_t& tmr = timer.tmr;
+ 
+     switch (address)
+@@ -306,7 +444,24 @@ uint8_t TIMER_ReadTMR(mcu_timer_t& timer, uint32_t address)
+     return 0xff;
+ }
+ 
+-inline void TIMER_ClockFrt(mcu_timer_t& timer, int frt_id)
++uint8_t TIMER_ReadTMR(mcu_timer_t& timer, uint32_t address)
++{
++    const uint8_t ret = ReadTMRRegisters(timer, address);
++    if (timer.shadow && timer.mode == TIMER_MODE_CHECK)
++    {
++        const uint8_t shadow_ret = ReadTMRRegisters(*timer.shadow, address);
++        timer.check_compares++;
++        if (shadow_ret != ret)
++            CheckRecord(timer, TIMER_CHECK_READ_VALUE, timer.cycles * 2);
++    }
++    return ret;
++}
++
++// ---------------------------------------------------------------------------
++// One timer tick (ORIGINAL bodies; the only place a tick's effects are
++// defined -- LAZY runs these for every event tick).
++// ---------------------------------------------------------------------------
++static inline void TIMER_ClockFrt(mcu_timer_t& timer, int frt_id)
+ {
+     frt_t& frt = timer.frt[frt_id];
+ 
+@@ -332,14 +487,14 @@ inline void TIMER_ClockFrt(mcu_timer_t& timer, int frt_id)
+         frt.tcsr |= FRT_TCSR_OCFB;
+ 
+     if ((frt.tcr & FRT_TCR_OVIE) != 0 && (frt.tcsr & FRT_TCSR_OVF) != 0)
+-        MCU_Interrupt_SetRequest(*timer.mcu, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_FOVI + frt_id * 4), 1);
++        TimerSetRequest(timer, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_FOVI + frt_id * 4), 1);
+     if ((frt.tcr & FRT_TCR_OCIEA) != 0 && (frt.tcsr & FRT_TCSR_OCFA) != 0)
+-        MCU_Interrupt_SetRequest(*timer.mcu, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_OCIA + frt_id * 4), 1);
++        TimerSetRequest(timer, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_OCIA + frt_id * 4), 1);
+     if ((frt.tcr & FRT_TCR_OCIEB) != 0 && (frt.tcsr & FRT_TCSR_OCFB) != 0)
+-        MCU_Interrupt_SetRequest(*timer.mcu, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_OCIB + frt_id * 4), 1);
++        TimerSetRequest(timer, (MCU_Interrupt_Source)(INTERRUPT_SOURCE_FRT0_OCIB + frt_id * 4), 1);
+ }
+ 
+-inline void TIMER_ClockTmr(mcu_timer_t& timer)
++static inline void TIMER_ClockTmr(mcu_timer_t& timer)
+ {
+     tmr_t& tmr = timer.tmr;
+ 
+@@ -369,14 +524,17 @@ inline void TIMER_ClockTmr(mcu_timer_t& timer)
+         tmr.tcsr |= TMR_TCSR_CMFB;
+ 
+     if ((tmr.tcr & TMR_TCR_OVIE) != 0 && (tmr.tcsr & TMR_TCSR_OVF) != 0)
+-        MCU_Interrupt_SetRequest(*timer.mcu, INTERRUPT_SOURCE_TIMER_OVI, 1);
++        TimerSetRequest(timer, INTERRUPT_SOURCE_TIMER_OVI, 1);
+     if ((tmr.tcr & TMR_TCR_CMIEA) != 0 && (tmr.tcsr & TMR_TCSR_CMFA) != 0)
+-        MCU_Interrupt_SetRequest(*timer.mcu, INTERRUPT_SOURCE_TIMER_CMIA, 1);
++        TimerSetRequest(timer, INTERRUPT_SOURCE_TIMER_CMIA, 1);
+     if ((tmr.tcr & TMR_TCR_CMIEB) != 0 && (tmr.tcsr & TMR_TCSR_CMFB) != 0)
+-        MCU_Interrupt_SetRequest(*timer.mcu, INTERRUPT_SOURCE_TIMER_CMIB, 1);
++        TimerSetRequest(timer, INTERRUPT_SOURCE_TIMER_CMIB, 1);
+ }
+ 
+-void TIMER_Clock(mcu_timer_t& timer, uint64_t cycles)
++// ---------------------------------------------------------------------------
++// LEGACY: the original TIMER_Clock, verbatim.
++// ---------------------------------------------------------------------------
++static void ClockLegacy(mcu_timer_t& timer, uint64_t cycles)
+ {
+     const uint64_t target_cycles = cycles / 2;
+ 
+@@ -398,17 +556,590 @@ void TIMER_Clock(mcu_timer_t& timer, uint64_t cycles)
+     }
+ }
+ 
+-// These tables are indexed by the low CKSn bits of the TCR.
+-constexpr FRT_Step_Table FRT_STEP_TABLE_GENERIC = {4, 8, 32, 2};
+-constexpr FRT_Step_Table FRT_STEP_TABLE_MK1     = {4, 8, 32, 4};
++// ---------------------------------------------------------------------------
++// LAZY helpers.
++// ---------------------------------------------------------------------------
+ 
+-// A value of 0 means do not step.
+-constexpr TMR_Step_Table TMR_STEP_TABLE_GENERIC = {0, 8, 64, 1024, 0, 2, 2, 2};
+-constexpr TMR_Step_Table TMR_STEP_TABLE_MK1     = {0, 8, 64, 1024, 0, 4, 4, 4};
++// Number of leading ticks, from the timer's current state, that are
++// provably "nothing but ++counter": no compare match, no wrap, and no
++// (enable && flag) pair that would re-issue an interrupt. 0 means the
++// NEXT tick must run the original body.
++static inline uint32_t FrtEventFree(const frt_t& f)
++{
++    if (((f.tcr & FRT_TCR_OVIE) != 0 && (f.tcsr & FRT_TCSR_OVF) != 0) ||
++        ((f.tcr & FRT_TCR_OCIEA) != 0 && (f.tcsr & FRT_TCSR_OCFA) != 0) ||
++        ((f.tcr & FRT_TCR_OCIEB) != 0 && (f.tcsr & FRT_TCSR_OCFB) != 0))
++        return 0;
++    const uint32_t ia = (uint32_t)((f.ocra - f.frc) & 0xffff);
++    const uint32_t ib = (uint32_t)((f.ocrb - f.frc) & 0xffff);
++    const uint32_t iw = (uint32_t)(0xffff - f.frc);
++    uint32_t e = ia < ib ? ia : ib;
++    if (iw < e)
++        e = iw;
++    return e;
++}
++
++static inline uint32_t TmrEventFree(const tmr_t& t)
++{
++    if (((t.tcr & TMR_TCR_OVIE) != 0 && (t.tcsr & TMR_TCSR_OVF) != 0) ||
++        ((t.tcr & TMR_TCR_CMIEA) != 0 && (t.tcsr & TMR_TCSR_CMFA) != 0) ||
++        ((t.tcr & TMR_TCR_CMIEB) != 0 && (t.tcsr & TMR_TCSR_CMFB) != 0))
++        return 0;
++    const uint32_t ia = (uint32_t)((t.tcora - t.tcnt) & 0xff);
++    const uint32_t ib = (uint32_t)((t.tcorb - t.tcnt) & 0xff);
++    const uint32_t iw = (uint32_t)(0xff - t.tcnt);
++    uint32_t e = ia < ib ? ia : ib;
++    if (iw < e)
++        e = iw;
++    return e;
++}
++
++// Apply every tick due up to target T: runs of event-free ticks as
++// one jump, event ticks through the original body.
++static void FrtMaterialize(mcu_timer_t& timer, uint32_t i, uint64_t T)
++{
++    frt_t& f = timer.frt[i];
++    while (f.deadline < T)
++    {
++        const uint32_t e = FrtEventFree(f);
++        if (e == 0)
++        {
++            TIMER_ClockFrt(timer, (int)i);
++            f.deadline += f.stride;
++            continue;
++        }
++        const unsigned shift = (unsigned)__builtin_ctz((unsigned)f.stride);
++        const uint64_t n = ((T - f.deadline) + f.stride - 1) >> shift;
++        uint64_t m = n < e ? n : e;
++        // Self-test fault injection: jump one tick PAST the event
++        // (the round-1 failure class). Never set outside TIMER_SelfTest.
++        if (timer.fault_inject && n > e)
++            m = (uint64_t)e + 1;
++        f.frc = (uint16_t)(f.frc + m);
++        f.deadline += m << shift;
++    }
++}
++
++static void TmrMaterialize(mcu_timer_t& timer, uint64_t T)
++{
++    tmr_t& t = timer.tmr;
++    while (t.deadline < T)
++    {
++        const uint32_t e = TmrEventFree(t);
++        if (e == 0)
++        {
++            TIMER_ClockTmr(timer);
++            t.deadline += t.stride;
++            continue;
++        }
++        const unsigned shift = (unsigned)__builtin_ctz((unsigned)t.stride);
++        const uint64_t n = ((T - t.deadline) + t.stride - 1) >> shift;
++        uint64_t m = n < e ? n : e;
++        if (timer.fault_inject && n > e)
++            m = (uint64_t)e + 1;
++        t.tcnt = (uint8_t)(t.tcnt + m);
++        t.deadline += m << shift;
++    }
++}
++
++static void MaterializeAll(mcu_timer_t& timer, uint64_t T)
++{
++    for (uint32_t i = 0; i < 3; ++i)
++        FrtMaterialize(timer, i, T);
++    TmrMaterialize(timer, T);
++}
++
++// First target at which this timer's next tick that is NOT a pure
++// increment becomes due. Tick j (0-based from the current state) runs
++// at the first T > deadline + j*stride, so for tick e that is
++// deadline + e*stride + 1. Below that target every due tick is
++// event-free and the whole timer can be left alone.
++static inline uint64_t FrtAttention(const frt_t& f)
++{
++    return f.deadline + (uint64_t)FrtEventFree(f) * f.stride + 1;
++}
++
++static inline uint64_t TmrAttention(const tmr_t& t)
++{
++    if (t.stride == 0)
++        return static_cast<uint64_t>(-1);
++    return t.deadline + (uint64_t)TmrEventFree(t) * t.stride + 1;
++}
++
++static void ClockLazy(mcu_timer_t& timer, uint64_t cycles)
++{
++    const uint64_t target_cycles = cycles / 2;
++    timer.cycles = target_cycles;
++    if (target_cycles < timer.next_attention)
++    {
++        timer.lazy_skips++;
++        return;
++    }
++    MaterializeAll(timer, target_cycles);
++    uint64_t attention = FrtAttention(timer.frt[0]);
++    for (uint32_t i = 1; i < 3; ++i)
++    {
++        const uint64_t a = FrtAttention(timer.frt[i]);
++        if (a < attention)
++            attention = a;
++    }
++    const uint64_t a = TmrAttention(timer.tmr);
++    if (a < attention)
++        attention = a;
++    timer.next_attention = attention;
++}
++
++// ---------------------------------------------------------------------------
++// CHECK mode.
++// ---------------------------------------------------------------------------
++static void CheckRecord(mcu_timer_t& timer, uint32_t code, uint64_t cycles)
++{
++    timer.check_mismatches++;
++    if (timer.check_mismatches == 1)
++    {
++        timer.check_first_cycles = cycles;
++        timer.check_first_code   = code;
++    }
++}
++
++// Full register-state comparison; returns 0 or the first differing
++// field's code.
++static uint32_t CompareState(const mcu_timer_t& a, const mcu_timer_t& b)
++{
++    for (uint32_t i = 0; i < 3; ++i)
++    {
++        const frt_t& x = a.frt[i];
++        const frt_t& y = b.frt[i];
++        const uint32_t base = TIMER_CHECK_FRT_BASE + 16 * i;
++        if (x.deadline != y.deadline) return base + 0;
++        if (x.tcr != y.tcr) return base + 1;
++        if (x.tcsr != y.tcsr) return base + 2;
++        if (x.frc != y.frc) return base + 3;
++        if (x.ocra != y.ocra) return base + 4;
++        if (x.ocrb != y.ocrb) return base + 5;
++        if (x.icr != y.icr) return base + 6;
++        if (x.status_rd != y.status_rd) return base + 7;
++        if (x.stride != y.stride) return base + 8;
++    }
++    const tmr_t& x = a.tmr;
++    const tmr_t& y = b.tmr;
++    if (x.deadline != y.deadline) return TIMER_CHECK_TMR_BASE + 0;
++    if (x.stride != y.stride) return TIMER_CHECK_TMR_BASE + 1;
++    if (x.tcr != y.tcr) return TIMER_CHECK_TMR_BASE + 2;
++    if (x.tcsr != y.tcsr) return TIMER_CHECK_TMR_BASE + 3;
++    if (x.tcora != y.tcora) return TIMER_CHECK_TMR_BASE + 4;
++    if (x.tcorb != y.tcorb) return TIMER_CHECK_TMR_BASE + 5;
++    if (x.tcnt != y.tcnt) return TIMER_CHECK_TMR_BASE + 6;
++    if (x.status_rd != y.status_rd) return TIMER_CHECK_TMR_BASE + 7;
++    if (a.tempreg != b.tempreg) return TIMER_CHECK_TEMPREG;
++    return TIMER_CHECK_OK;
++}
++
++static void ClockCheck(mcu_timer_t& timer, uint64_t cycles)
++{
++    mcu_timer_t& sh = *timer.shadow;
++    const bool materialized = (cycles / 2) >= timer.next_attention;
++    ClockLazy(timer, cycles);
++    sh.req_mask = 0;
++    ClockLegacy(sh, cycles);
++
++    // Interrupt requests: compared on EVERY call. A lazily skipped
++    // call has req_mask 0, so an event the legacy timer fires on this
++    // step but the lazy one does not (or vice versa) is caught at the
++    // exact step.
++    timer.check_compares++;
++    if (timer.req_mask != sh.req_mask)
++        CheckRecord(timer, TIMER_CHECK_REQ_MASK, cycles);
++
++    // Register state: at every materialization, and forced at least
++    // every 1024 calls so long skip runs are verified too.
++    const bool force = ((++timer.check_counter) & 1023u) == 0u;
++    if (materialized || force)
++    {
++        if (force)
++        {
++            MaterializeAll(timer, timer.cycles);
++            timer.next_attention = 0; // recomputed on the next call
++        }
++        timer.check_compares++;
++        const uint32_t code = CompareState(timer, sh);
++        if (code != TIMER_CHECK_OK)
++            CheckRecord(timer, code, cycles);
++    }
++}
++
++void TIMER_Clock(mcu_timer_t& timer, uint64_t cycles)
++{
++    timer.req_mask = 0;
++    switch (timer.mode)
++    {
++    case TIMER_MODE_LAZY:
++        ClockLazy(timer, cycles);
++        return;
++    case TIMER_MODE_CHECK:
++        if (timer.shadow)
++        {
++            ClockCheck(timer, cycles);
++            return;
++        }
++        ClockLazy(timer, cycles);
++        return;
++    default:
++        ClockLegacy(timer, cycles);
++        return;
++    }
++}
+ 
+ void TIMER_NotifyRomsetChange(mcu_timer_t& timer)
+ {
+-    const bool is_mk1    = timer.mcu->is_mk1;
+-    timer.frt_step_table = is_mk1 ? FRT_STEP_TABLE_MK1 : FRT_STEP_TABLE_GENERIC;
+-    timer.tmr_step_table = is_mk1 ? TMR_STEP_TABLE_MK1 : TMR_STEP_TABLE_GENERIC;
++    const bool is_mk1 = timer.mcu->is_mk1;
++    TIMER_SetTables(timer, is_mk1);
++    if (timer.shadow)
++        TIMER_SetTables(*timer.shadow, is_mk1);
++}
++
++// ---------------------------------------------------------------------------
++// Round-3 control.
++// ---------------------------------------------------------------------------
++static void SyncShadow(mcu_timer_t& timer)
++{
++    mcu_timer_t& sh = *timer.shadow;
++    sh.mode      = TIMER_MODE_LEGACY;
++    sh.mcu       = timer.mcu;
++    sh.req_sink  = &timer.shadow_sink;
++    sh.shadow    = nullptr;
++    sh.cycles    = timer.cycles;
++    for (uint32_t i = 0; i < 3; ++i)
++        sh.frt[i] = timer.frt[i];
++    sh.tmr            = timer.tmr;
++    sh.tempreg        = timer.tempreg;
++    sh.frt_step_table = timer.frt_step_table;
++    sh.tmr_step_table = timer.tmr_step_table;
++    sh.req_mask       = 0;
++    sh.next_attention = 0;
++    sh.fault_inject   = 0;
++    timer.shadow_sink = 0;
++}
++
++bool TIMER_SetMode(mcu_timer_t& timer, uint8_t mode)
++{
++    // Bring the state fully up to date under the CURRENT mode first,
++    // so any mode switch starts from the exact legacy-equivalent state.
++    if (timer.mode != TIMER_MODE_LEGACY)
++        MaterializeAll(timer, timer.cycles);
++    timer.next_attention = 0;
++    timer.lazy_skips     = 0;
++
++    if (mode == TIMER_MODE_CHECK)
++    {
++        if (!timer.shadow)
++            timer.shadow = new mcu_timer_t;
++        if (!timer.shadow)
++        {
++            timer.mode = TIMER_MODE_LAZY;
++            return false;
++        }
++        SyncShadow(timer);
++        timer.check_compares     = 0;
++        timer.check_mismatches   = 0;
++        timer.check_first_cycles = 0;
++        timer.check_first_code   = 0;
++        timer.check_counter      = 0;
++    }
++    timer.mode = mode;
++    return true;
++}
++
++uint8_t TIMER_GetMode(const mcu_timer_t& timer)
++{
++    return timer.mode;
++}
++
++TimerCheckStatus TIMER_GetCheckStatus(const mcu_timer_t& timer)
++{
++    TimerCheckStatus st;
++    st.active       = (timer.mode == TIMER_MODE_CHECK && timer.shadow != nullptr) ? 1 : 0;
++    st.compares     = timer.check_compares;
++    st.mismatches   = timer.check_mismatches;
++    st.first_cycles = timer.check_first_cycles;
++    st.first_code   = timer.check_first_code;
++    st.lazy_skips   = timer.lazy_skips;
++    return st;
++}
++
++// ---------------------------------------------------------------------------
++// Self-test (LEGACY vs LAZY on sinks, with optional fault injection).
++// ---------------------------------------------------------------------------
++namespace
++{
++    struct SelfTestRng
++    {
++        uint64_t state;
++        uint32_t Next()
++        {
++            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
++            return (uint32_t)(state >> 33);
++        }
++    };
++
++    void SelfTestWrite(mcu_timer_t& a, mcu_timer_t& b, uint32_t frt_addr_base, SelfTestRng& rng)
++    {
++        const uint32_t r    = rng.Next();
++        const uint32_t kind = r & 3;
++        if (kind != 0)
++        {
++            // FRT write: address 0x10 + 16*t + reg (as MCU_DeviceWrite
++            // sees it, TIMER_WriteFRT decodes t = (addr >> 4) - 1).
++            const uint32_t t    = (r >> 2) % 3;
++            const uint32_t base = frt_addr_base + 16 * t;
++            const uint32_t sel  = (r >> 4) % 9;
++            const frt_t& cur    = a.frt[t];
++            uint8_t hi, lo;
++            switch (sel)
++            {
++            case 0: // TCR: clock select + random enables
++                TIMER_WriteFRT(a, base + REG_TCR, (uint8_t)(r >> 8));
++                TIMER_WriteFRT(b, base + REG_TCR, (uint8_t)(r >> 8));
++                break;
++            case 1: // TCSR: flag clears (0 bits) + CCLRA etc.
++                TIMER_WriteFRT(a, base + REG_TCSR, (uint8_t)(r >> 8));
++                TIMER_WriteFRT(b, base + REG_TCSR, (uint8_t)(r >> 8));
++                break;
++            case 2: { // OCRA near the counter (event soon)
++                const uint16_t v = (uint16_t)(cur.frc + 1 + ((r >> 8) % 400));
++                hi = (uint8_t)(v >> 8); lo = (uint8_t)v;
++                TIMER_WriteFRT(a, base + REG_OCRAH, hi); TIMER_WriteFRT(a, base + REG_OCRAL, lo);
++                TIMER_WriteFRT(b, base + REG_OCRAH, hi); TIMER_WriteFRT(b, base + REG_OCRAL, lo);
++                break;
++            }
++            case 3: { // OCRB near the counter
++                const uint16_t v = (uint16_t)(cur.frc + 1 + ((r >> 8) % 400));
++                hi = (uint8_t)(v >> 8); lo = (uint8_t)v;
++                TIMER_WriteFRT(a, base + REG_OCRBH, hi); TIMER_WriteFRT(a, base + REG_OCRBL, lo);
++                TIMER_WriteFRT(b, base + REG_OCRBH, hi); TIMER_WriteFRT(b, base + REG_OCRBL, lo);
++                break;
++            }
++            case 4: { // OCRA anywhere
++                const uint16_t v = (uint16_t)(r >> 8);
++                hi = (uint8_t)(v >> 8); lo = (uint8_t)v;
++                TIMER_WriteFRT(a, base + REG_OCRAH, hi); TIMER_WriteFRT(a, base + REG_OCRAL, lo);
++                TIMER_WriteFRT(b, base + REG_OCRAH, hi); TIMER_WriteFRT(b, base + REG_OCRAL, lo);
++                break;
++            }
++            case 5: { // FRC near the wrap
++                const uint16_t v = (uint16_t)(0xffd0 + ((r >> 8) % 48));
++                hi = (uint8_t)(v >> 8); lo = (uint8_t)v;
++                TIMER_WriteFRT(a, base + REG_FRCH, hi); TIMER_WriteFRT(a, base + REG_FRCL, lo);
++                TIMER_WriteFRT(b, base + REG_FRCH, hi); TIMER_WriteFRT(b, base + REG_FRCL, lo);
++                break;
++            }
++            case 6: { // FRC anywhere
++                const uint16_t v = (uint16_t)(r >> 8);
++                hi = (uint8_t)(v >> 8); lo = (uint8_t)v;
++                TIMER_WriteFRT(a, base + REG_FRCH, hi); TIMER_WriteFRT(a, base + REG_FRCL, lo);
++                TIMER_WriteFRT(b, base + REG_FRCH, hi); TIMER_WriteFRT(b, base + REG_FRCL, lo);
++                break;
++            }
++            case 7: { // OCRA == FRC (match on the very next tick)
++                const uint16_t v = cur.frc;
++                hi = (uint8_t)(v >> 8); lo = (uint8_t)v;
++                TIMER_WriteFRT(a, base + REG_OCRAH, hi); TIMER_WriteFRT(a, base + REG_OCRAL, lo);
++                TIMER_WriteFRT(b, base + REG_OCRAH, hi); TIMER_WriteFRT(b, base + REG_OCRAL, lo);
++                break;
++            }
++            default: { // ICR
++                const uint16_t v = (uint16_t)(r >> 8);
++                hi = (uint8_t)(v >> 8); lo = (uint8_t)v;
++                TIMER_WriteFRT(a, base + REG_ICRH, hi); TIMER_WriteFRT(a, base + REG_ICRL, lo);
++                TIMER_WriteFRT(b, base + REG_ICRH, hi); TIMER_WriteFRT(b, base + REG_ICRL, lo);
++                break;
++            }
++            }
++        }
++        else
++        {
++            const uint32_t sel = (r >> 2) % 7;
++            const tmr_t& cur   = a.tmr;
++            uint32_t addr; uint8_t v;
++            switch (sel)
++            {
++            case 0: addr = DEV_TMR_TCR;   v = (uint8_t)(r >> 8); break;                                  // clock select incl. 0 (stopped) and CCLR modes
++            case 1: addr = DEV_TMR_TCSR;  v = (uint8_t)(r >> 8); break;
++            case 2: addr = DEV_TMR_TCORA; v = (uint8_t)(cur.tcnt + 1 + ((r >> 8) % 60)); break;        // match soon
++            case 3: addr = DEV_TMR_TCORB; v = (uint8_t)(cur.tcnt + 1 + ((r >> 8) % 60)); break;
++            case 4: addr = DEV_TMR_TCNT;  v = (uint8_t)(0xf0 + ((r >> 8) % 16)); break;                 // near wrap
++            case 5: addr = DEV_TMR_TCORA; v = cur.tcnt; break;                                         // match on the next tick
++            default: addr = DEV_TMR_TCNT; v = (uint8_t)(r >> 8); break;
++            }
++            TIMER_WriteTMR(a, addr, v);
++            TIMER_WriteTMR(b, addr, v);
++        }
++    }
++}
++
++uint64_t TIMER_SelfTest(bool is_mk1, uint32_t steps, bool inject)
++{
++    mcu_timer_t* pA = new mcu_timer_t; // legacy reference
++    mcu_timer_t* pB = new mcu_timer_t; // lazy under test
++    if (!pA || !pB)
++        return 1; // cannot test: report as a failure
++    mcu_timer_t& a = *pA;
++    mcu_timer_t& b = *pB;
++    uint32_t sinkA = 0, sinkB = 0;
++    a.req_sink = &sinkA;
++    b.req_sink = &sinkB;
++    TIMER_SetTables(a, is_mk1);
++    TIMER_SetTables(b, is_mk1);
++    ResetRegisters(a);
++    ResetRegisters(b);
++    a.mode = TIMER_MODE_LEGACY;
++    b.mode = TIMER_MODE_LAZY;
++    b.fault_inject = inject ? 1 : 0;
++
++    // Kick the timers into realistic configurations first: FRTs
++    // running with compare interrupts enabled (what the SC-55 firmware
++    // does), TMR running on an 8x prescaler with CCLR0.
++    const uint32_t frt_addr_base = 0x10;
++    for (uint32_t t = 0; t < 3; ++t)
++    {
++        const uint32_t base = frt_addr_base + 16 * t;
++        TIMER_WriteFRT(a, base + REG_TCR, (uint8_t)(FRT_TCR_OCIEA | (t & 3)));
++        TIMER_WriteFRT(b, base + REG_TCR, (uint8_t)(FRT_TCR_OCIEA | (t & 3)));
++        TIMER_WriteFRT(a, base + REG_TCSR, FRT_TCSR_CCLRA);
++        TIMER_WriteFRT(b, base + REG_TCSR, FRT_TCSR_CCLRA);
++        TIMER_WriteFRT(a, base + REG_OCRAH, 0x01); TIMER_WriteFRT(a, base + REG_OCRAL, (uint8_t)(0x40 + 7 * t));
++        TIMER_WriteFRT(b, base + REG_OCRAH, 0x01); TIMER_WriteFRT(b, base + REG_OCRAL, (uint8_t)(0x40 + 7 * t));
++    }
++    TIMER_WriteTMR(a, DEV_TMR_TCORA, 0x7d);
++    TIMER_WriteTMR(b, DEV_TMR_TCORA, 0x7d);
++    TIMER_WriteTMR(a, DEV_TMR_TCR, (uint8_t)(TMR_TCR_CMIEA | TMR_TCR_CCLR0 | 1));
++    TIMER_WriteTMR(b, DEV_TMR_TCR, (uint8_t)(TMR_TCR_CMIEA | TMR_TCR_CCLR0 | 1));
++
++    SelfTestRng rng{0x9E3779B97F4A7C15ULL ^ (inject ? 0x55ULL : 0ULL)};
++    uint64_t mismatches = 0;
++    uint64_t cycles     = 0;
++    for (uint32_t step = 0; step < steps; ++step)
++    {
++        const uint32_t r = rng.Next();
++        if ((r % 97u) == 0u)
++            SelfTestWrite(a, b, frt_addr_base, rng);
++        if ((r % 61u) == 0u)
++        {
++            // A read from both (exercises materialize-on-read and the
++            // status_rd / tempreg side effects); values must agree.
++            const uint32_t r2 = rng.Next();
++            uint8_t va, vb;
++            if (r2 & 1)
++            {
++                const uint32_t addr = frt_addr_base + 16 * ((r2 >> 1) % 3) + ((r2 >> 3) % 10);
++                va = TIMER_ReadFRT(a, addr);
++                vb = TIMER_ReadFRT(b, addr);
++            }
++            else
++            {
++                const uint32_t addr = DEV_TMR_TCR + ((r2 >> 1) % 5);
++                va = TIMER_ReadTMR(a, addr);
++                vb = TIMER_ReadTMR(b, addr);
++            }
++            if (va != vb)
++                mismatches++;
++        }
++
++        cycles += 12;
++        const uint64_t attention_before = b.next_attention;
++        TIMER_Clock(a, cycles);
++        TIMER_Clock(b, cycles);
++
++        if (a.req_mask != b.req_mask)
++            mismatches++;
++        if (sinkA != sinkB)
++            mismatches++;
++
++        // Emulate the MCU taking a pending interrupt (Exclude) and, most
++        // of the time, its ISR acknowledging the flag the way the firmware
++        // does: read TCSR (which arms status_rd), then write TCSR with that
++        // flag bit cleared. Without the acknowledge the flag stays set, the
++        // (enable && flag) pair forces the legacy-exact slow path on every
++        // call, and the lazy fast path would never be exercised. Some
++        // takes deliberately skip the acknowledge so the re-issue path
++        // (flag still set -> request re-asserted next tick) is covered too.
++        if ((r % 13u) == 0u && sinkA != 0u)
++        {
++            const uint32_t lowest = sinkA & (0u - sinkA);
++            sinkA &= ~lowest;
++            sinkB &= ~lowest;
++            if ((r % 5u) != 0u)
++            {
++                const uint32_t src = (uint32_t)__builtin_ctz(lowest);
++                uint32_t addr = 0; uint8_t flag = 0; bool is_frt = false;
++                if (src >= INTERRUPT_SOURCE_FRT0_ICI && src <= INTERRUPT_SOURCE_FRT2_FOVI)
++                {
++                    const uint32_t t = (src - INTERRUPT_SOURCE_FRT0_ICI) / 4;
++                    const uint32_t k = (src - INTERRUPT_SOURCE_FRT0_ICI) % 4; // 0 ICI, 1 OCIA, 2 OCIB, 3 FOVI
++                    addr = frt_addr_base + 16 * t + REG_TCSR;
++                    flag = (k == 1) ? (uint8_t)FRT_TCSR_OCFA : (k == 2) ? (uint8_t)FRT_TCSR_OCFB : (k == 3) ? (uint8_t)FRT_TCSR_OVF : (uint8_t)FRT_TCSR_ICF;
++                    is_frt = true;
++                }
++                else if (src == INTERRUPT_SOURCE_TIMER_CMIA || src == INTERRUPT_SOURCE_TIMER_CMIB || src == INTERRUPT_SOURCE_TIMER_OVI)
++                {
++                    addr = DEV_TMR_TCSR;
++                    flag = (src == INTERRUPT_SOURCE_TIMER_CMIA) ? (uint8_t)TMR_TCSR_CMFA : (src == INTERRUPT_SOURCE_TIMER_CMIB) ? (uint8_t)TMR_TCSR_CMFB : (uint8_t)TMR_TCSR_OVF;
++                }
++                if (flag != 0)
++                {
++                    uint8_t va, vb;
++                    if (is_frt)
++                    {
++                        va = TIMER_ReadFRT(a, addr);
++                        vb = TIMER_ReadFRT(b, addr);
++                    }
++                    else
++                    {
++                        va = TIMER_ReadTMR(a, addr);
++                        vb = TIMER_ReadTMR(b, addr);
++                    }
++                    if (va != vb)
++                        mismatches++;
++                    // Keep the low (control) nibble, keep every other flag
++                    // set (= not acknowledged), clear only this flag.
++                    const uint8_t data = (uint8_t)((va & 0x0f) | (0xf0 & ~flag));
++                    if (is_frt)
++                    {
++                        TIMER_WriteFRT(a, addr, data);
++                        TIMER_WriteFRT(b, addr, data);
++                    }
++                    else
++                    {
++                        TIMER_WriteTMR(a, addr, data);
++                        TIMER_WriteTMR(b, addr, data);
++                    }
++                }
++            }
++        }
++
++        // Full state comparison whenever the lazy side materialized on
++        // its own this step (attention reached, or a read/write above)
++        // and, forced, every 256 steps -- the same cadence as CHECK
++        // mode, so long skip runs are exercised AND verified. The
++        // req_mask / sink comparison above catches a mis-timed event at
++        // its exact step; this catches counter/flag divergence.
++        const bool materialized = (b.cycles >= attention_before) || ((r % 97u) == 0u) || ((r % 61u) == 0u) || ((r % 13u) == 0u);
++        if (materialized || (step & 255u) == 0u)
++        {
++            MaterializeAll(b, b.cycles);
++            if (CompareState(a, b) != TIMER_CHECK_OK)
++                mismatches++;
++        }
++    }
++
++    // The test must also prove that the LAZY fast path engaged: a lazy
++    // timer that materializes every call trivially agrees with legacy
++    // and would validate nothing. Expect at least one skipped call per
++    // 8 steps over this sequence (events are hundreds of ticks apart).
++    if (b.lazy_skips < steps / 8)
++        mismatches++;
++
++    delete pA;
++    delete pB;
++    return mismatches;
+ }
+diff --git a/src/backend/mcu_timer.h b/src/backend/mcu_timer.h
+index c883521..253e53c 100644
+--- a/src/backend/mcu_timer.h
++++ b/src/backend/mcu_timer.h
+@@ -53,6 +53,31 @@ struct tmr_t
+     uint8_t  status_rd = 0;
+ };
+ 
++// mt32-pi (round 3): TIMER_Clock execution modes.
++//
++// LEGACY: the original per-tick loops (one TIMER_ClockFrt / ClockTmr
++//   body per timer tick, ~5 bodies per MCU step on MK1).
++// LAZY:   event-driven. Timer ticks that can neither match, wrap nor
++//   (re)issue an interrupt only increment a counter, so runs of them
++//   are applied arithmetically, and TIMER_Clock returns after a single
++//   compare while the next event is still in the future. Register
++//   reads/writes materialize the affected timer first, so every value
++//   the MCU can observe, and every interrupt request, is identical to
++//   LEGACY by construction. See mcu_timer.cpp for the argument.
++// CHECK:  LAZY, plus a shadow LEGACY timer stepped in lockstep. The
++//   interrupt requests issued per call are compared on EVERY call, the
++//   full register state at every materialization and at least every
++//   1024 calls, and every register read's value. The first mismatch is
++//   recorded (TIMER_GetCheckStatus) -- this is the on-device detector
++//   for the class of bug that failed the round-1 timer attempt (an
++//   event shifted by one tick).
++enum TimerMode : uint8_t
++{
++    TIMER_MODE_LEGACY = 0,
++    TIMER_MODE_LAZY   = 1,
++    TIMER_MODE_CHECK  = 2,
++};
++
+ struct mcu_timer_t
+ {
+     uint64_t cycles = 0;
+@@ -64,6 +89,47 @@ struct mcu_timer_t
+ 
+     FRT_Step_Table frt_step_table;
+     TMR_Step_Table tmr_step_table;
++
++    // --- round 3 ---
++    uint8_t  mode           = TIMER_MODE_LEGACY;
++    uint8_t  fault_inject   = 0; // self-test only: make the lazy jump skip one event tick
++    uint32_t req_mask       = 0; // interrupt requests (value 1) issued by the last TIMER_Clock call, bit = MCU_Interrupt_Source
++    uint64_t next_attention = 0; // LAZY: smallest target (cycles/2) that needs non-trivial work
++    uint64_t lazy_skips     = 0; // LAZY: calls that returned on the fast path (diagnostic)
++
++    // Interrupt sink override: when non-null, every interrupt request
++    // this timer would send to its MCU goes to this bit mask instead
++    // (bit = MCU_Interrupt_Source). Used by the CHECK-mode shadow and
++    // by the self-test, so neither needs a second mcu_t.
++    uint32_t* req_sink = nullptr;
++
++    // CHECK mode: shadow legacy timer, its sink word, and the mismatch
++    // record.
++    mcu_timer_t* shadow             = nullptr;
++    uint32_t     shadow_sink        = 0;
++    uint64_t     check_compares     = 0;
++    uint64_t     check_mismatches   = 0;
++    uint64_t     check_first_cycles = 0; // mcu cycles at the first mismatch
++    uint32_t     check_first_code   = 0; // see TimerCheckCode
++    uint32_t     check_counter      = 0;
++};
++
++// Mismatch codes (first mismatch only is recorded).
++//   1          different interrupt requests this call (req_mask)
++//   4          a register read returned a different byte
++//   5          tempreg differs
++//   0x100 + 16*frt + field    FRT state field differs
++//              (field: 0 deadline 1 tcr 2 tcsr 3 frc 4 ocra 5 ocrb 6 icr 7 status_rd 8 stride)
++//   0x200 + field             TMR state field differs
++//              (field: 0 deadline 1 stride 2 tcr 3 tcsr 4 tcora 5 tcorb 6 tcnt 7 status_rd)
++enum TimerCheckCode : uint32_t
++{
++    TIMER_CHECK_OK          = 0,
++    TIMER_CHECK_REQ_MASK    = 1,
++    TIMER_CHECK_READ_VALUE  = 4,
++    TIMER_CHECK_TEMPREG     = 5,
++    TIMER_CHECK_FRT_BASE    = 0x100,
++    TIMER_CHECK_TMR_BASE    = 0x200,
+ };
+ 
+ void TIMER_Init(mcu_timer_t& timer, mcu_t& mcu);
+@@ -81,3 +147,36 @@ uint8_t TIMER_ReadTMR(mcu_timer_t& timer, uint32_t address);
+ void TIMER_Clock(mcu_timer_t& timer, uint64_t cycles);
+ 
+ void TIMER_NotifyRomsetChange(mcu_timer_t& timer);
++
++// --- round 3 ---
++
++// Select the execution mode. Safe between steps. CHECK allocates the
++// shadow timer on first use and re-synchronizes it from the live
++// state every time it is selected. Returns false if the shadow could
++// not be allocated (the mode then falls back to LAZY).
++bool    TIMER_SetMode(mcu_timer_t& timer, uint8_t mode);
++uint8_t TIMER_GetMode(const mcu_timer_t& timer);
++
++struct TimerCheckStatus
++{
++    uint8_t  active;        // 1 if CHECK mode is running
++    uint64_t compares;
++    uint64_t mismatches;
++    uint64_t first_cycles;  // mcu cycles of the first mismatch (0 if none)
++    uint32_t first_code;
++    uint64_t lazy_skips;
++};
++TimerCheckStatus TIMER_GetCheckStatus(const mcu_timer_t& timer);
++
++// Self-test of the LAZY implementation AND of the detector: runs a
++// scripted pseudo-random register/clock/interrupt-take sequence
++// through a LEGACY timer and a LAZY timer (both with interrupt sinks,
++// no mcu_t needed) for `steps` MCU steps, comparing register state,
++// per-call interrupt requests, pending-interrupt sets and read values
++// at every step. Returns the mismatch count. With `inject` set, the
++// LAZY side's jump deliberately skips one tick past an event (the
++// round-1 failure class); a working detector must then return a
++// NON-ZERO count. The kernel runs both at boot and logs
++// timer_selftest=pass only if the plain run returns 0 AND the
++// injected run returns > 0.
++uint64_t TIMER_SelfTest(bool is_mk1, uint32_t steps, bool inject);
 diff --git a/src/backend/nuked_profile.h b/src/backend/nuked_profile.h
 new file mode 100644
-index 0000000..9ea3a05
+index 0000000..68f4178
 --- /dev/null
 +++ b/src/backend/nuked_profile.h
-@@ -0,0 +1,26 @@
+@@ -0,0 +1,32 @@
 +#pragma once
 +
 +// mt32-pi diagnostics profiling (not part of upstream Nuked-SC55).
@@ -1493,12 +2532,103 @@ index 0000000..9ea3a05
 +using NukedProfileClockFn = uint64_t (*)();
 +
 +void NukedProfileSetClock(NukedProfileClockFn pFn);
-+NukedProfileClockFn NukedProfileClock();
++// Inline accessor (round 3): MCU_StepMCU consults this every step, so
++// it must not be an out-of-line call.
++extern NukedProfileClockFn g_nukedProfileClockFn;
++inline NukedProfileClockFn NukedProfileClock()
++{
++    return g_nukedProfileClockFn;
++}
 +NukedProfileData& NukedProfile();
 diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
+index b8a4e27..f9899bf 100644
 --- a/src/backend/pcm.cpp
 +++ b/src/backend/pcm.cpp
-@@ -1101,6 +1101,12 @@
+@@ -21,6 +21,7 @@
+  *
+  */
+ #include "pcm.h"
++#include "split_thread_circle.h"
+ #include "mcu.h"
+ #include "mcu_interrupt.h"
+ #include <cstdint>
+@@ -62,8 +63,14 @@ uint8_t PCM_ReadROM(pcm_t& pcm, uint32_t address)
+     return 0;
+ }
+ 
+-void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data)
++// mt32-pi dual-core split (round 3): PCM_Write and PCM_WriteDeferred
++// share one body. Defer = false performs the ram1/ram2 store (the
++// original PCM_Write, unchanged); Defer = true hands the store back to
++// the caller. Everything else is identical by construction.
++template <bool Defer>
++static inline bool PCM_WriteImpl(pcm_t& pcm, uint32_t address, uint8_t data, PCMDeferredStore* out)
+ {
++    (void)out;
+     address &= 0x3f;
+     if (address < 0x4) // voice enable
+     {
+@@ -148,7 +155,15 @@ void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data)
+             if ((address & 4) == 0)
+                 ix |= 2;
+ 
+-            pcm.ram1[pcm.select_channel][ix] = pcm.write_latch;
++            if constexpr (Defer)
++            {
++                *out = PCMDeferredStore{0, pcm.select_channel, static_cast<uint8_t>(ix), 0, pcm.write_latch};
++                return true;
++            }
++            else
++            {
++                pcm.ram1[pcm.select_channel][ix] = pcm.write_latch;
++            }
+         }
+     }
+     else if ((address >= 0x10 && address < 0x20) || (address >= 0x30 && address < 0x38))
+@@ -170,9 +185,28 @@ void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data)
+             if (address & 32)
+                 ix |= 8;
+ 
+-            pcm.ram2[pcm.select_channel][ix] = static_cast<uint16_t>(pcm.write_latch);
++            if constexpr (Defer)
++            {
++                *out = PCMDeferredStore{1, pcm.select_channel, static_cast<uint8_t>(ix), 0, static_cast<uint16_t>(pcm.write_latch)};
++                return true;
++            }
++            else
++            {
++                pcm.ram2[pcm.select_channel][ix] = static_cast<uint16_t>(pcm.write_latch);
++            }
+         }
+     }
++    return false;
++}
++
++void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data)
++{
++    PCM_WriteImpl<false>(pcm, address, data, nullptr);
++}
++
++bool PCM_WriteDeferred(pcm_t& pcm, uint32_t address, uint8_t data, PCMDeferredStore* out)
++{
++    return PCM_WriteImpl<true>(pcm, address, data, out);
+ }
+ 
+ // rv: [30][2], [30][3]
+@@ -575,6 +609,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+ {
+     while (pcm.cycles < cycles)
+     {
++        // mt32-pi dual-core split (round 3): per-tick hook (tick count +
++        // the sync profile's tick-boundary work: deferred-store drain or
++        // lock hand-off). No-op in single-threaded mode (g_splitT null).
++        if (g_splitT)
++            g_splitT->DrainBeforeTick(pcm);
++
+         const uint32_t voice_active = pcm.voice_mask & pcm.voice_mask_pending;
+         { // final mixing
+             int shifter = pcm.ram2[30][10];
+@@ -1088,6 +1128,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
          pcm.rcsum[0] = 0;
          pcm.rcsum[1] = 0;
  
@@ -1511,7 +2641,16 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
          for (int slot = 0; slot < pcm.config.reg_slots; slot++)
          {
              uint32_t *ram1 = pcm.ram1[slot];
-@@ -1573,6 +1579,16 @@
+@@ -1425,7 +1471,7 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+                 if (pcm.mcu->is_jv880)
+                     MCU_GA_SetGAInt(*pcm.mcu, 5, 1);
+                 else
+-                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++                    SplitAssertIrq0(pcm);
+             }
+ 
+             int volmul1 = 0;
+@@ -1549,6 +1595,16 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
              }
          }
  
@@ -1528,7 +2667,7 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
          if (pcm.nfs)
          {
              pcm.ram2[31][7] |= 0x20;
-@@ -1612,3 +1628,5634 @@
+@@ -1574,3 +1630,5634 @@ uint32_t PCM_GetOutputFrequency(const pcm_t& pcm)
          return freq / 2;
      }
  }
@@ -2436,7 +3575,7 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
 +                    // so no unlocked RMW races the locked writers.
 +                    // No double delivery: the IRQ FIFO no longer
 +                    // exists, so this is the only delivery path.
-+                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++                    SplitAssertIrq0(pcm);
 +            }
 +
 +            int volmul1 = 0;
@@ -3485,7 +4624,7 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
 +                    // so no unlocked RMW races the locked writers.
 +                    // No double delivery: the IRQ FIFO no longer
 +                    // exists, so this is the only delivery path.
-+                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++                    SplitAssertIrq0(pcm);
 +            }
 +
 +        };
@@ -4555,7 +5694,7 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
 +                    // so no unlocked RMW races the locked writers.
 +                    // No double delivery: the IRQ FIFO no longer
 +                    // exists, so this is the only delivery path.
-+                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++                    SplitAssertIrq0(pcm);
 +            }
 +
 +            int volmul1 = 0;
@@ -5687,7 +6826,7 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
 +                    // so no unlocked RMW races the locked writers.
 +                    // No double delivery: the IRQ FIFO no longer
 +                    // exists, so this is the only delivery path.
-+                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++                    SplitAssertIrq0(pcm);
 +            }
 +
 +            int volmul1 = 0;
@@ -6828,7 +7967,7 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
 +                    // so no unlocked RMW races the locked writers.
 +                    // No double delivery: the IRQ FIFO no longer
 +                    // exists, so this is the only delivery path.
-+                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++                    SplitAssertIrq0(pcm);
 +            }
 +
 +            int volmul1 = 0;
@@ -7163,12 +8302,40 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
 +    }
 +    g_pcmVariants[0].update(pcm, cycles);
 +}
+diff --git a/src/backend/pcm.h b/src/backend/pcm.h
+index 15f9a17..ca3f965 100644
+--- a/src/backend/pcm.h
++++ b/src/backend/pcm.h
+@@ -80,6 +80,23 @@ struct pcm_t
+ };
+ 
+ void PCM_Write(pcm_t& pcm, uint32_t address, uint8_t data);
++
++// mt32-pi dual-core split (round 3): one committed ram1/ram2 store,
++// produced by PCM_WriteDeferred instead of being applied, so the
++// PCM core can apply it at a tick boundary. value holds the full
++// write latch (ram1: 20 bits; ram2: low 16 bits).
++struct PCMDeferredStore
++{
++    uint8_t  is_ram2;
++    uint8_t  channel;
++    uint8_t  index;
++    uint8_t  pad;
++    uint32_t value;
++};
++// Exactly PCM_Write, except that a committing ram1/ram2 store is
++// returned in *out (and true) instead of being performed. Every other
++// effect (latches, voice mask, wave ROM, config) is applied as usual.
++bool PCM_WriteDeferred(pcm_t& pcm, uint32_t address, uint8_t data, PCMDeferredStore* out);
+ uint8_t PCM_Read(pcm_t& pcm, uint32_t address);
+ void PCM_Init(pcm_t& pcm, mcu_t& mcu);
+ void PCM_Update(pcm_t& pcm, uint64_t cycles);
 diff --git a/src/backend/split_thread_circle.h b/src/backend/split_thread_circle.h
 new file mode 100644
-index 0000000..4cae550
+index 0000000..be633a7
 --- /dev/null
 +++ b/src/backend/split_thread_circle.h
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,634 @@
 +/*
 + * Copyright (C) 2024-2026 J.C. Moyer
 + *
@@ -7187,103 +8354,108 @@ index 0000000..4cae550
 +
 +/*
 + * split_thread_circle.h -- skeletal JV880-shape sync for the mt32-pi
-+ * minimal validity kernel (Sterr1/Mini-JV880pi shape, adapted).
++ * minimal validity kernel (Sterr1/Mini-JV880pi shape, adapted), with
++ * the ROUND-3 sync profiles (2026-10-31).
 + *
-+ * This REPLACES the timestamped-FIFO + RPC split that wedged on
-+ * hardware (core 2 in RPC-wait, core 3 stuck in the RPC claim
-+ * Acquire, with the Circle sev fix present). Everything the old
-+ * header did is gone: no write FIFO, no IRQ FIFO, no RPC
-+ * back-channel, no shadows, no tick rule, no lookahead bound.
-+ * The MCU core never waits on the PCM core for anything, and the
-+ * PCM core never waits on the MCU core for anything except the
-+ * published cycle count (an atomic load, never blocking).
-+ *
-+ * The shape, mirrored from Sterr1 (minijv880.cpp Run, mcu.h
-+ * MCU_PostSample, pcm.cpp PCM_Write/PCM_Read lock scopes):
++ * The base shape is unchanged from the shaped-var kernel:
 + * - SHARED pcm state: both cores use the SAME pcm_t in memory.
 + *   MCU_Write writes registers DIRECTLY into it; MCU_Read reads
 + *   DIRECTLY from it. No shadows for live reads.
-+ * - CYCLE-COUNT PUBLISH: core 2 RELEASE-stores mcu.cycles after
-+ *   every MCU step (StepMCU = one instruction, so this is
-+ *   per-instruction publish, exactly Sterr1's granularity). Core 3
-+ *   ACQUIRE-loads it and renders ONLY up to that target, never
-+ *   beyond. The RELEASE/ACQUIRE pair is the happens-before edge
-+ *   that makes the direct reads valid: every register write the
-+ *   MCU made before publishing cycle C is visible to any core
-+ *   that ACQUIRE-loads a count >= C.
-+ * - CORE-3 BATCHES: bounded (128 ticks = Sterr1's 128 samples:
-+ *   this backend renders one sample per tick at native rate),
-+ *   each batch under the state lock, idle-wait via the ARM
-+ *   yield-hint pause (SplitPause -- this kernel registers no
-+ *   CScheduler tasks, so Yield() can never return, and wfe is
-+ *   never used for a wait here).
-+ * - STATE LOCK: one CSpinLock (WITH Circle's sev fix, as in the
-+ *   sevfix tree) for the hot path, exactly as in Sterr1: single
-+ *   RAM-store holds on the MCU side, whole-batch holds on the
-+ *   PCM side. See SkelPCMWrite/SkelPCMRead for the exact scopes.
-+ * - NO OVERSHOOT: the batch target passed to PCM_Update is capped
-+ *   at (published - 800). A tick is at most 800 cycles
-+ *   ((reg_slots+1)*25, reg_slots <= 31), and PCM_Update renders
-+ *   the tick that crosses its target, so capping at published-800
-+ *   guarantees no tick ever ends past the published cycle count.
-+ *   Core 3 therefore lags published by at most ~800 cycles
-+ *   (~2 samples typical, ~16 at boot tick size) -- negligible
-+ *   against the 16384-frame sample ring.
++ * - CYCLE-COUNT PUBLISH: core 2 RELEASE-stores mcu.cycles (every
++ *   step in the legacy profile; every N steps in the round-3
++ *   profiles, see the publish-interval argument below). Core 3
++ *   ACQUIRE-loads it and renders ONLY up to that target minus one
++ *   max tick (800 cycles), never beyond.
++ * - CORE-3 BATCHES: bounded (128 ticks), idle-wait via yield hint.
 + *
-+ * Deviations from Sterr1, all deliberate and documented here:
-+ * (1) Write-lock scope: Sterr1 holds pcm_lock for the single RAM
-+ *     store only; the latch accumulation happens outside the lock.
-+ *     Our backend's PCM_Write fuses latch accumulation and the
-+ *     store in one function, so splitting them would duplicate
-+ *     backend logic. SkelPCMWrite therefore holds the state lock
-+ *     for the WHOLE PCM_Write call, but ONLY for writes that
-+ *     actually commit a store (ram1 iff (addr&3)==3, ram2 iff
-+ *     (addr&1)==1, ranges per backend pcm.cpp PCM_Write). The
-+ *     latch state (write_latch) is core-2-only -- every use is
-+ *     inside PCM_Write, core 3 never touches it -- so holding
-+ *     the lock across the latch ops changes nothing semantically
-+ *     and costs a few integer ops. Which writes take the lock
-+ *     matches Sterr1 exactly.
-+ * (2) Idle-wait: SplitPause (ARM yield hint) instead of Sterr1's
-+ *     CTimer::SimpleMsDelay(0). This kernel's spin waits all use
-+ *     the yield hint (no CScheduler tasks exist), and the task
-+ *     specifies it.
-+ * (3) Publish point: after StepMCU, before StepPeripherals.
-+ *     Sterr1 publishes right after the cycles increment, before
-+ *     TIMER_Clock/UART/analog -- the same order: StepMCU ends
-+ *     with cycles += 12, and the peripherals do not touch pcm_t.
-+ * (4) IRQ delivery: the voice-end assert takes the direct
-+ *     MCU_Interrupt_SetRequest(IRQ0, 1) path (pcm.cpp assert site;
-+ *     the old FIFO branch was deleted with the FIFO), as Sterr1
-+ *     sets its GA line directly from the PCM core. The assert-set
-+ *     (core 3, under
-+ *     the state lock during a batch) and the status-read ACK
-+ *     clear (core 2, under the state lock) are serialized by the
-+ *     lock; MCU_Interrupt_Handle only READS interrupt_pending
-+ *     (it never Excludes from it), so no unlocked RMW races the
-+ *     locked writers.
-+ * (5) Sample ring: Sterr1's ring lives in the app (MCU_PostSample
-+ *     + core-2 drain), not in this header. This kernel's ring is
-+ *     include/ring.h (SkelRing), which mirrors Sterr1's
-+ *     discipline exactly (monotonic uint64 indices, modulo slots,
-+ *     drop-oldest with a counter, RELEASE publish / ACQUIRE
-+ *     consume) -- including its drop-path property: when the ring
-+ *     is full, a concurrent consumer dequeue can make the
-+ *     producer's drop store move read_idx backward by a few
-+ *     slots, re-delivering already-consumed frames. That only
-+ *     fires when the ring is full, and the pass bar requires
-+ *     ring_drops == 0 (never full), so it cannot affect a clean
-+ *     run; it is inherited from Sterr1, not introduced here.
++ * ROUND 3 (what this header adds -- all selected at RUN TIME through
++ * the SplitSyncProfile the kernel copies into the state at
++ * activation, so every profile runs from one kernel image and the
++ * auto-sequence can A/B them on real hardware):
 + *
-+ * No-op stubs (DrainBeforeTick / PublishRenderedStep / DrainIrq)
-+ * exist ONLY because backend pcm.cpp / emu.cpp still call those
-+ * hooks; the skeletal flow never needs them (shared state needs
-+ * no draining, no RenderStep publication, no IRQ back-channel).
-+ * They compile to nothing and must stay no-ops.
++ * (1) LAYOUT: the state is split onto separate 64-byte cache lines by
++ *     writer: the lock words, the core-2 -> core-3 published cycle
++ *     count, the core-3-written stats, the core-2-written stats, and
++ *     the read-mostly configuration. The old layout put the lock, the
++ *     per-step published counter and both cores' per-batch/per-op
++ *     stats on ONE line, so every core-2 publish and every core-3
++ *     batch end bounced that line between the cores.
 + *
-+ * Scope: MK1 only, as before. The dispatch bypasses to the direct
-+ * path for any non-MK1 model, and the kernel only activates the
-+ * split for MK1 romsets.
++ * (2) PUBLISH INTERVAL: cycles_pub is published every
++ *     sync.publish_interval steps (1 = legacy). Correctness: core 3
++ *     renders only ticks ending <= published - 800. A tick ending at E
++ *     needs the register writes of every step k with 12*(k-1) < E,
++ *     i.e. 12k < E + 12. Core 3 only renders E after ACQUIRE-loading a
++ *     published value P >= E + 800, and the RELEASE store of P
++ *     happened after step P/12, so every step k with 12k <= P is
++ *     visible. Since E + 12 <= P - 788 < P, the needed steps are
++ *     visible for ANY publish spacing; the 800-cycle cap already
++ *     covers 66 steps of slack. The kernel caps the interval at 32
++ *     (384 cycles, well under one tick) and always publishes once more
++ *     at the end of a step loop so the render position never waits
++ *     for the next chunk.
++ *
++ * (3) LOCK MODES (sync.lock_mode):
++ *     BATCH (legacy): core 3 holds the state lock for a whole batch;
++ *       core 2 takes it for each committing ram1/ram2 store and each
++ *       status read (0x3c/0x3e). Core 2 can therefore wait for up to
++ *       a whole batch.
++ *     TICK: as BATCH, but core 3 hands the lock over at every tick
++ *       boundary when core 2 has announced a wait (writer_want): core
++ *       3 releases, waits until core 2 has taken the lock, then
++ *       re-acquires (it then waits for core 2's single store, not the
++ *       other way round). Core 2's wait is bounded by ONE tick.
++ *     FREE: no lock anywhere. Core 2 stores straight into ram1/ram2
++ *       while core 3 may be mid-tick. EXPERIMENT ONLY: it bounds the
++ *       gain available from removing the lock, but a core-2 store can
++ *       be lost to a concurrent core-3 read-modify-write of the same
++ *       word (ram2[slot][7] key/nibble update, ram2[slot][8] phase,
++ *       ram1[slot][4] address writeback). Never ship.
++ *     FIFO: core 2 never blocks. Each committing store is pushed as a
++ *       (ram, channel, index, value) record into a single-producer
++ *       single-consumer FIFO; core 3 applies all pending records at
++ *       each TICK BOUNDARY, in order, before rendering the tick. This
++ *       is exactly the single-threaded emulator's semantics: in
++ *       MCU_Step a register write (inside the instruction) always
++ *       lands BEFORE the PCM_Update that follows the step, i.e. at a
++ *       tick boundary, never mid-tick. Core 2's own latch reads of
++ *       ram1/ram2 consult the pending records first (newest wins), so
++ *       read-your-own-write holds exactly as in the single-threaded
++ *       engine; words core 3 mutates (envelopes, addresses) read live,
++ *       as they did before (unlocked in Sterr1 and here).
++ *
++ * (4) IRQ0 HAND-OFF (sync.legacy_irq = 0): core 3 no longer calls
++ *     MCU_Interrupt_SetRequest(IRQ0, 1) itself. That call is a
++ *     read-modify-write of mcu.interrupt_pending, a word core 2 also
++ *     read-modify-writes WITHOUT the state lock every step (timer
++ *     Include/Exclude, interrupt take). The legacy path therefore has
++ *     a real lost-update window (core 3 under the lock vs core 2's
++ *     timers outside it). Round 3 raises a one-byte flag (irq0_req)
++ *     with a RELEASE store; core 2 folds it into interrupt_pending at
++ *     the top of its next step. All interrupt_pending writers are
++ *     then core 2. The status-read ACK (0x3e) clears irq_assert with
++ *     an atomic exchange, so no lock is needed around it either.
++ *
++ * (5) INSTRUMENTATION COST: the shaped-var kernel timed every core-2
++ *     lock op with two CTimer::GetClockTicks() calls (ISB + counter
++ *     read + 64-bit divide each) and two ISB-fenced PMU reads. Round-3
++ *     profiles time a lock op only when the first try-acquire fails,
++ *     with unfenced PMU reads (lock_contended counts those ops;
++ *     lock_wait_us is derived from lock_wait_cyc at 1 GHz).
++ *
++ * (6) The Circle CSpinLock (default IRQ_LEVEL) runs EnterCritical /
++ *     LeaveCritical (DAIF save/restore + per-core nesting arrays +
++ *     DMB) around a WFE spin. Cores 2 and 3 take no device IRQs
++ *     (Circle routes them to core 0), so round-3 profiles use a raw
++ *     TASK-level spinlock (LDAXR/STXR try, STLR release) instead
++ *     (sync.legacy_lock = 0). The legacy profile keeps CSpinLock.
++ *
++ * Every profile shares one pcm_t and one set of PCM_Update variants;
++ * only the coordination changes. Profile 0 reproduces the shaped-var
++ * kernel's behaviour exactly (every knob at its legacy value), so the
++ * old baseline remains the reference.
++ *
++ * Scope: MK1 only, as before.
 + */
 +
 +#pragma once
@@ -7291,7 +8463,6 @@ index 0000000..4cae550
 +#include <cstdint>
 +#include <utility>
 +
-+#include <circle/sched/scheduler.h>
 +#include <circle/spinlock.h>
 +#include <circle/synchronize.h>
 +#include <circle/timer.h>
@@ -7300,12 +8471,8 @@ index 0000000..4cae550
 +#include "mcu_interrupt.h"
 +#include "pcm.h"
 +
-+// Local cross-core barrier. Circle's DataMemBarrier() expands to bare
-+// "dmb", which the AArch64 assembler rejects (an option operand is
-+// required on AArch64; bare dmb/dsb are ARMv7 forms). "dmb ish" is
-+// the inner-shareable barrier -- the right domain for visibility
-+// between cores of one SoC -- and is what every DataMemBarrier()
-+// call site below actually needs.
++// Local cross-core barrier ("dmb ish": inner-shareable, the right
++// domain for visibility between cores of one SoC).
 +static inline void SplitDMB()
 +{
 +    __asm__ volatile ("dmb ish" ::: "memory");
@@ -7317,26 +8484,26 @@ index 0000000..4cae550
 +    __asm__ volatile ("yield" ::: "memory");
 +}
 +
-+// PMU cycle-counter read (FFmpeg checkasm port): isb, then read the
-+// per-core 64-bit cycle counter. Used by the app's core loops AND
-+// by the backend (Skel lock timing, PCM_Update mix bracketing), so
-+// it lives here. At 1 GHz the 64-bit counter cannot wrap inside a
-+// window. If the counter was never enabled (or failed validation),
-+// it reads stuck and every derived delta is 0 -- never a valid
-+// nonzero value, which is why the boot line's pmc2/pmc3 is the
-+// validity signal for the cycle fields.
++// PMU cycle-counter reads. PMU_ReadCycles is the fenced read (isb
++// first: exact, used for the per-window/per-batch brackets).
++// PMU_ReadCyclesFast omits the isb: a few cycles of skew, used only
++// inside the hot lock path (round-3 profiles) where an isb per op
++// would itself be a measurable cost.
 +static inline uint64_t PMU_ReadCycles()
 +{
 +    uint64_t nCycles = 0;
 +    __asm__ volatile ("isb; mrs %0, pmccntr_el0" : "=r" (nCycles));
 +    return nCycles;
 +}
++static inline uint64_t PMU_ReadCyclesFast()
++{
++    uint64_t nCycles = 0;
++    __asm__ volatile ("mrs %0, pmccntr_el0" : "=r" (nCycles));
++    return nCycles;
++}
 +
 +// Variant descriptor table (data-driven dispatch): number, short
-+// name, full name, and PCM_Update implementation. Defined in pcm.cpp
-+// (where the implementations live); the app reads names + count
-+// from it, so adding a variant is one table entry + its function --
-+// no switch to rewrite in either file.
++// name, full name, and PCM_Update implementation. Defined in pcm.cpp.
 +struct PCMVariantDesc {
 +    int number;
 +    const char* short_name;
@@ -7346,11 +8513,37 @@ index 0000000..4cae550
 +extern const PCMVariantDesc g_pcmVariants[];
 +extern const int g_pcmVariantCount;
 +
-+// Table-driven dispatcher (defined in pcm.cpp): looks the variant
-+// number up in g_pcmVariants and calls its implementation. All
-+// variants share the same pcm_t state; only the compute path
-+// changes. Unknown numbers fall back to baseline (entry 0).
++// Table-driven dispatcher (defined in pcm.cpp).
 +void PCM_Update_Variant(pcm_t& pcm, uint64_t cycles, int variant);
++
++// ---------------------------------------------------------------------------
++// Round-3 sync profile (runtime-selected coordination parameters).
++// ---------------------------------------------------------------------------
++enum SplitLockMode : uint8_t {
++    SPLIT_LOCK_BATCH = 0,   // legacy: whole-batch hold on core 3
++    SPLIT_LOCK_TICK  = 1,   // per-tick hand-off when core 2 waits
++    SPLIT_LOCK_FREE  = 2,   // no lock (EXPERIMENT: lost-update hazard)
++    SPLIT_LOCK_FIFO  = 3,   // deferred stores applied at tick boundaries
++};
++
++struct SplitSyncProfile {
++    int         number;
++    const char* short_name;
++    const char* full_name;
++    uint8_t     lock_mode;            // SplitLockMode
++    uint8_t     legacy_lock;          // 1 = Circle CSpinLock (IRQ_LEVEL), 0 = raw TASK-level spinlock
++    uint8_t     legacy_timing;        // 1 = CTimer + fenced PMU reads around EVERY lock op (shaped-var), 0 = contended-only, unfenced
++    uint8_t     legacy_irq;           // 1 = core 3 calls MCU_Interrupt_SetRequest(IRQ0) directly, 0 = irq0_req flag folded by core 2
++    uint16_t    publish_interval;     // steps between cycles_pub RELEASE stores (1 = every step)
++    uint16_t    ring_check_interval;  // steps between ring Avail() checks in the step loop (1 = every step)
++    uint16_t    core3_backoff;        // yield-hint iterations between idle polls of cycles_pub (0 = tight spin)
++};
++
++// Deferred-store FIFO (SPLIT_LOCK_FIFO). Records are PCMDeferredStore
++// (declared in pcm.h, produced by PCM_WriteDeferred), applied by
++// core 3 at a tick boundary.
++static constexpr uint32_t SplitFifoSize = 4096;      // records; power of two
++static constexpr uint32_t SplitFifoMask = SplitFifoSize - 1;
 +
 +struct ThreadSplitStateCircle;
 +
@@ -7359,65 +8552,201 @@ index 0000000..4cae550
 +// teardown so a stale state can never dispatch.
 +extern ThreadSplitStateCircle* g_splitT;
 +
-+struct ThreadSplitStateCircle {
-+    // The one hot-path lock (CSpinLock WITH the Circle sev fix).
-+    // MCU side: held for a committing RAM store only (see
-+    // SkelPCMWrite) or a brief status computation (see SkelPCMRead).
-+    // PCM side: held for each whole render batch.
++struct alignas(64) ThreadSplitStateCircle {
++    // ---- line 0: lock words (written by both cores, rarely) ----
++    // Legacy lock (CSpinLock WITH Circle's IRQ_LEVEL critical section),
++    // used by profiles with legacy_lock = 1.
 +    CSpinLock state_lock;
++    // Raw TASK-level spinlock word (0 = free, 1 = held), profiles with
++    // legacy_lock = 0.
++    uint32_t raw_lock{0};
++    // SPLIT_LOCK_TICK hand-off flag: core 2 sets it (RELEASE) before
++    // spinning on the lock, clears it once it holds the lock; core 3
++    // polls it at every tick boundary.
++    uint32_t writer_want{0};
 +
-+    // Published MCU cycle count. Plain field, accessed ONLY via
-+    // __atomic builtins cross-core: core 2 stores with RELEASE
-+    // after each StepMCU, core 3 loads with ACQUIRE. (InitFromPCM
-+    // stores plainly: single-threaded context, before the state
-+    // is published with DMBs by the app.)
-+    uint64_t cycles_pub{0};
++    // ---- line 1: core 2 -> core 3 published cycle count ----
++    // Plain field, accessed ONLY via __atomic builtins cross-core:
++    // core 2 stores with RELEASE, core 3 loads with ACQUIRE.
++    alignas(64) uint64_t cycles_pub{0};
 +
-+    // Batch discipline (see the header comment): a tick is at most
-+    // (31+1)*25 = 800 cycles, and a batch renders at most 128 ticks
-+    // (Sterr1's 128-sample bound; one tick = one sample here).
++    // ---- line 2: core-3-written, core-2-read ----
++    alignas(64) volatile uint64_t pcm_rendered{0};
++    volatile uint64_t pcm_task_us{0};
++    volatile uint64_t max_pcm_lag{0};
++    volatile uint64_t pcm_task_cyc{0};   // core-3 total PCM task work (same scope as pcm_task_us)
++    volatile uint64_t mix_cyc{0};        // core-3 voice-mix portion per batch
++    volatile uint64_t ticks{0};          // PCM ticks rendered (counted in DrainBeforeTick, every variant)
++    volatile uint64_t fifo_tail{0};      // FIFO consumer index (core 3)
++    // IRQ0 request flag: core 3 sets 1 (RELEASE) when a voice-end IRQ
++    // is asserted (legacy_irq = 0); core 2 folds it into
++    // interrupt_pending at the top of its next step.
++    volatile uint8_t  irq0_req{0};
++
++    // ---- line 3: core-3 PMU event snapshots (core 3 writes per batch) ----
++    alignas(64) volatile uint64_t c3_ev[4]{0, 0, 0, 0};
++
++    // ---- line 4: core-2-written, core-2-read (window writer is core 2) ----
++    alignas(64) volatile uint64_t lock_wait_us{0};   // legacy timing only (CTimer); derived from cycles otherwise
++    volatile uint64_t lock_waits{0};                 // every core-2 lock op
++    volatile uint64_t lock_wait_cyc{0};              // core-2 spin cycles (NOP-corrected in legacy timing)
++    volatile uint64_t lock_contended{0};             // core-2 lock ops whose first try failed (round-3 timing)
++    volatile uint64_t publishes{0};                  // cycles_pub RELEASE stores
++    volatile uint64_t fifo_full_waits{0};            // FIFO pushes that had to wait for core 3 (must be 0)
++    volatile uint64_t fifo_hw{0};                    // FIFO depth high-water mark
++    volatile uint64_t irq0_folded{0};                // IRQ0 flags folded by core 2
++
++    // ---- line 5: FIFO producer index + core-2-private caches ----
++    alignas(64) volatile uint64_t fifo_head{0};      // FIFO producer index (core 2)
++    uint64_t fifo_tail_cache{0};                      // core-2 private copy of fifo_tail
++
++    // ---- line 6: read-mostly configuration ----
++    alignas(64) volatile uint64_t nop_cyc2{0};       // each core's back-to-back double-read cost
++    volatile uint64_t nop_cyc3{0};
++    SplitSyncProfile sync{0, "legacy", "legacy", SPLIT_LOCK_BATCH, 1, 1, 1, 1, 1, 0};
++
++    // Batch discipline: a tick is at most (31+1)*25 = 800 cycles, and
++    // a batch renders at most 128 ticks (Sterr1's 128-sample bound).
 +    static constexpr uint64_t MaxTickCycles = 800;
 +    static constexpr uint64_t MaxBatchTicks = 128;
 +
-+    // Render position + stats (core 3 writes, core 2 reads; single
-+    // writer each, volatile + DMB as in the old header). pcm_rendered
-+    // is STATS ONLY now -- core 2 waits on nothing.
-+    volatile uint64_t pcm_rendered{0};
-+    volatile uint64_t pcm_task_us{0};
-+    volatile uint64_t max_pcm_lag{0};
++    // ---- FIFO storage (its own lines; written by core 2, read by core 3) ----
++    alignas(64) PCMDeferredStore fifo[SplitFifoSize]{};
 +
-+    // DIAG (shaped-diag only): core-2 state-lock spin waits.
-+    // Written ONLY by the MCU thread (core 2) in
-+    // SkelPCMWrite/SkelPCMRead; read by core 2's window writer.
-+    // Core 3's batch holds are NOT counted here (they are what
-+    // core 2 waits ON). Two CTimer reads per lock op add ns-scale
-+    // overhead to the hot path -- diagnostic only, never shipped.
-+    volatile uint64_t lock_wait_us{0};
-+    volatile uint64_t lock_waits{0};
++    // --- raw lock primitives (legacy_lock = 0) ---
++    bool RawTryAcquire()
++    {
++        return __atomic_exchange_n(&raw_lock, 1u, __ATOMIC_ACQUIRE) == 0u;
++    }
++    void RawAcquire()
++    {
++        while (!RawTryAcquire())
++        {
++            while (__atomic_load_n(&raw_lock, __ATOMIC_RELAXED) != 0u)
++                SplitPause();
++        }
++    }
++    void RawRelease()
++    {
++        __atomic_store_n(&raw_lock, 0u, __ATOMIC_RELEASE);
++    }
 +
-+    // PMU (shaped-var only): cumulative cycle counters, same delta
-+    // discipline as the _us counters (the app snapshots them per
-+    // window; InitFromPCM deliberately does NOT reset them, exactly
-+    // like lock_wait_us/lock_waits -- the window snapshots stay
-+    // consistent across the reset inside DoVariantAdvance).
-+    // pcm_task_cyc: core-3 total PCM task work (same scope as
-+    // pcm_task_us). mix_cyc: core-3 voice-mix portion, accumulated
-+    // PER BATCH inside the PCM_Update variants (not per tick, to
-+    // keep read overhead negligible). lock_wait_cyc: core-2
-+    // state-lock spin cycles, NOP-corrected per op at accumulation
-+    // (see SkelPCMWrite/SkelPCMRead). nop_cyc2/nop_cyc3: each
-+    // core's back-to-back double-read cost, measured once at loop
-+    // start, NEVER reset (not per-activation data).
-+    volatile uint64_t pcm_task_cyc{0};
-+    volatile uint64_t mix_cyc{0};
-+    volatile uint64_t lock_wait_cyc{0};
-+    volatile uint64_t nop_cyc2{0};
-+    volatile uint64_t nop_cyc3{0};
++    // Core-3 side of the state lock (batch acquire/release, and the
++    // TICK hand-off). Which lock object is used follows the profile.
++    void Core3Acquire()
++    {
++        if (sync.legacy_lock)
++            state_lock.Acquire();
++        else
++            RawAcquire();
++    }
++    void Core3Release()
++    {
++        if (sync.legacy_lock)
++            state_lock.Release();
++        else
++            RawRelease();
++    }
++    // Does core 3 hold the state lock across a batch in this profile?
++    bool Core3LocksBatch() const
++    {
++        return sync.lock_mode == SPLIT_LOCK_BATCH || sync.lock_mode == SPLIT_LOCK_TICK;
++    }
 +
-+    // No-op stubs for the backend hooks (see the header comment).
-+    // pcm.cpp's tick hook and end hook, and emu.cpp's SplitDrainIrq,
-+    // still call these; they must do nothing.
-+    void DrainBeforeTick(pcm_t&) {
++    // Apply every pending deferred store (SPLIT_LOCK_FIFO), core 3,
++    // tick boundary. One ACQUIRE load of the producer index per tick
++    // in the common (empty) case.
++    void FifoDrain(pcm_t& pcm)
++    {
++        uint64_t nTail = fifo_tail;
++        const uint64_t nHead = __atomic_load_n(&fifo_head, __ATOMIC_ACQUIRE);
++        if (nHead == nTail)
++            return;
++        while (nTail != nHead)
++        {
++            const PCMDeferredStore& st = fifo[nTail & SplitFifoMask];
++            if (st.is_ram2)
++                pcm.ram2[st.channel][st.index] = static_cast<uint16_t>(st.value);
++            else
++                pcm.ram1[st.channel][st.index] = st.value;
++            ++nTail;
++        }
++        __atomic_store_n(&fifo_tail, nTail, __ATOMIC_RELEASE);
++    }
++
++    // Push one deferred store (core 2). Never drops: if the FIFO is
++    // full (4096 pending stores -- impossible in practice, core 3
++    // drains every tick) it waits for core 3 and counts the wait.
++    void FifoPush(const PCMDeferredStore& st)
++    {
++        const uint64_t nHead = fifo_head;
++        if (nHead - fifo_tail_cache >= SplitFifoSize)
++        {
++            fifo_tail_cache = __atomic_load_n(&fifo_tail, __ATOMIC_ACQUIRE);
++            if (nHead - fifo_tail_cache >= SplitFifoSize)
++            {
++                fifo_full_waits = fifo_full_waits + 1;
++                do
++                {
++                    SplitPause();
++                    fifo_tail_cache = __atomic_load_n(&fifo_tail, __ATOMIC_ACQUIRE);
++                } while (nHead - fifo_tail_cache >= SplitFifoSize);
++            }
++        }
++        fifo[nHead & SplitFifoMask] = st;
++        __atomic_store_n(&fifo_head, nHead + 1, __ATOMIC_RELEASE);
++        const uint64_t nDepth = nHead + 1 - fifo_tail_cache;
++        if (nDepth > fifo_hw)
++            fifo_hw = nDepth;
++    }
++
++    // Core-2 read-your-own-write overlay (SPLIT_LOCK_FIFO): the newest
++    // pending store to (ram, channel, index), if any. Scans newest to
++    // oldest; the FIFO is usually empty or a few records deep.
++    bool FifoLookup(bool bRam2, uint8_t nChannel, uint8_t nIndex, uint32_t* pValue)
++    {
++        const uint64_t nHead = fifo_head;
++        fifo_tail_cache = __atomic_load_n(&fifo_tail, __ATOMIC_ACQUIRE);
++        uint64_t n = nHead;
++        while (n != fifo_tail_cache)
++        {
++            --n;
++            const PCMDeferredStore& st = fifo[n & SplitFifoMask];
++            if ((st.is_ram2 != 0) == bRam2 && st.channel == nChannel && st.index == nIndex)
++            {
++                *pValue = st.value;
++                return true;
++            }
++        }
++        return false;
++    }
++
++    // Per-tick hook, called by EVERY PCM_Update variant at the top of
++    // each tick (core 3). Counts ticks and runs the mode's boundary
++    // work: FIFO drain, or the TICK hand-off. BATCH/FREE: count only.
++    void DrainBeforeTick(pcm_t& pcm)
++    {
++        ticks = ticks + 1;
++        switch (sync.lock_mode)
++        {
++        case SPLIT_LOCK_FIFO:
++            FifoDrain(pcm);
++            break;
++        case SPLIT_LOCK_TICK:
++            if (__atomic_load_n(&writer_want, __ATOMIC_ACQUIRE) != 0u)
++            {
++                Core3Release();
++                // Wait until core 2 holds the lock (it clears
++                // writer_want right after acquiring), then queue
++                // behind its single store.
++                while (__atomic_load_n(&writer_want, __ATOMIC_ACQUIRE) != 0u)
++                    SplitPause();
++                Core3Acquire();
++            }
++            break;
++        default:
++            break;
++        }
 +    }
 +
 +    void PublishRenderedStep(pcm_t&, uint64_t) {
@@ -7428,74 +8757,207 @@ index 0000000..4cae550
 +
 +    // (Re)initialize from a live pcm_t after single-threaded priming
 +    // or an emulator reset. The caller guarantees the PCM task is
-+    // stopped (app handshake) and the MCU thread is not stepping,
-+    // so no barrier is needed here; the app issues DMBs before
-+    // publishing g_splitT.
++    // stopped (app handshake) and the MCU thread is not stepping.
++    // The FIFO is empty by construction here (core 3 drained it
++    // before parking, and no MCU step ran since), so resetting both
++    // indices is safe. Cumulative counters are deliberately NOT reset
++    // (the app snapshots them per window).
 +    void InitFromPCM(pcm_t& pcm, mcu_t& mcu) {
 +        cycles_pub = (uint64_t)mcu.cycles;
 +        pcm_rendered = pcm.cycles;
 +        pcm_task_us = 0;
 +        max_pcm_lag = 0;
++        fifo_head = 0;
++        fifo_tail = 0;
++        fifo_tail_cache = 0;
++        irq0_req = 0;
++        writer_want = 0;
++        raw_lock = 0;
 +    }
 +};
 +
-+// MCU thread: direct register write into shared pcm state, with the
-+// state lock held ONLY for a committing RAM store (Sterr1's scope;
-+// see the header comment for the fused-latch sub-deviation).
-+// Ranges and commit bits are backend pcm.cpp PCM_Write verbatim:
++// ---------------------------------------------------------------------------
++// Core-2 lock path.
++// ---------------------------------------------------------------------------
++inline void SplitCore2Acquire(ThreadSplitStateCircle& s)
++{
++    if (s.sync.legacy_lock)
++    {
++        // shaped-var instrumentation, verbatim: two CTimer reads + two
++        // fenced PMU reads per op when legacy_timing is set.
++        if (s.sync.legacy_timing)
++        {
++            const uint64_t t0 = CTimer::GetClockTicks();
++            const uint64_t c0 = PMU_ReadCycles();
++            s.state_lock.Acquire();
++            s.lock_wait_us = s.lock_wait_us + (CTimer::GetClockTicks() - t0);
++            const uint64_t cDelta = PMU_ReadCycles() - c0;
++            const uint64_t cNop = s.nop_cyc2;
++            s.lock_wait_cyc = s.lock_wait_cyc + (cDelta >= cNop ? cDelta - cNop : 0);
++        }
++        else
++        {
++            s.state_lock.Acquire();
++        }
++        s.lock_waits = s.lock_waits + 1;
++        return;
++    }
++    if (s.sync.lock_mode == SPLIT_LOCK_TICK)
++        __atomic_store_n(&s.writer_want, 1u, __ATOMIC_RELEASE);
++    if (!s.RawTryAcquire())
++    {
++        s.lock_contended = s.lock_contended + 1;
++        const uint64_t c0 = PMU_ReadCyclesFast();
++        s.RawAcquire();
++        s.lock_wait_cyc = s.lock_wait_cyc + (PMU_ReadCyclesFast() - c0);
++    }
++    if (s.sync.lock_mode == SPLIT_LOCK_TICK)
++        __atomic_store_n(&s.writer_want, 0u, __ATOMIC_RELAXED);
++    s.lock_waits = s.lock_waits + 1;
++}
++
++inline void SplitCore2Release(ThreadSplitStateCircle& s)
++{
++    if (s.sync.legacy_lock)
++        s.state_lock.Release();
++    else
++        s.RawRelease();
++}
++
++// Core 3's voice-end IRQ assert. Called at the 4 PCM_Update assert
++// sites (baseline + 3 variants) in place of the direct
++// MCU_Interrupt_SetRequest(IRQ0, 1). pcm.irq_assert / irq_channel are
++// already set by the caller. Legacy profile: the direct call (as
++// shipped). Round 3: one-byte flag with RELEASE, folded by core 2.
++inline void SplitAssertIrq0(pcm_t& pcm)
++{
++    if (g_splitT && !g_splitT->sync.legacy_irq)
++        __atomic_store_n(&g_splitT->irq0_req, static_cast<uint8_t>(1), __ATOMIC_RELEASE);
++    else
++        MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++}
++
++// Core 2: fold a pending IRQ0 request into interrupt_pending. Called
++// at the top of every step by the kernel's step loop (one ACQUIRE
++// byte load; the line is written by core 3 only on voice ends).
++inline void SplitFoldIrq0(ThreadSplitStateCircle& s, mcu_t& mcu)
++{
++    if (__atomic_load_n(&s.irq0_req, __ATOMIC_ACQUIRE) != 0u)
++    {
++        __atomic_exchange_n(&s.irq0_req, static_cast<uint8_t>(0), __ATOMIC_ACQ_REL);
++        MCU_Interrupt_SetRequest(mcu, INTERRUPT_SOURCE_IRQ0, 1);
++        s.irq0_folded = s.irq0_folded + 1;
++    }
++}
++
++// MCU thread: direct register write into shared pcm state. Which
++// writes COMMIT a ram1/ram2 store is backend PCM_Write verbatim:
 +// ram1 (0x04-0x10, 0x24-0x30) commits iff (addr&3)==3;
-+// ram2 (0x10-0x20, 0x30-0x38) commits iff (addr&1)==1.
-+// All other addresses (voice mask, wave ROM, config) never store
-+// and never take the lock -- exactly as in Sterr1.
++// ram2 (0x10-0x20, 0x30-0x38) commits iff (addr&1)==1. Non-committing
++// bytes only touch core-2-private latch state and never synchronize.
 +inline void SkelPCMWrite(mcu_t& mcu, uint32_t addr, uint8_t value) {
 +    addr &= 0x3f;
 +    const bool bCommits =
 +        ((((addr >= 0x04 && addr < 0x10) || (addr >= 0x24 && addr < 0x30)) && ((addr & 3) == 3)) ||
 +         (((addr >= 0x10 && addr < 0x20) || (addr >= 0x30 && addr < 0x38)) && ((addr & 1) == 1)));
-+    if (bCommits) {
-+        ThreadSplitStateCircle& s = *g_splitT;
-+        const uint64_t t0 = CTimer::GetClockTicks();
-+        const uint64_t c0 = PMU_ReadCycles();
-+        s.state_lock.Acquire();
-+        s.lock_wait_us = s.lock_wait_us + (CTimer::GetClockTicks() - t0);
-+        const uint64_t cDelta = PMU_ReadCycles() - c0;
-+        const uint64_t cNop = s.nop_cyc2;
-+        s.lock_wait_cyc = s.lock_wait_cyc + (cDelta >= cNop ? cDelta - cNop : 0);
-+        s.lock_waits = s.lock_waits + 1;
++    if (!bCommits)
++    {
 +        PCM_Write(*mcu.pcm, addr, value);
-+        s.state_lock.Release();
-+    } else {
++        return;
++    }
++    ThreadSplitStateCircle& s = *g_splitT;
++    switch (s.sync.lock_mode)
++    {
++    case SPLIT_LOCK_FREE:
 +        PCM_Write(*mcu.pcm, addr, value);
++        return;
++    case SPLIT_LOCK_FIFO:
++    {
++        PCMDeferredStore st;
++        if (PCM_WriteDeferred(*mcu.pcm, addr, value, &st))
++            s.FifoPush(st);
++        return;
++    }
++    default:
++        SplitCore2Acquire(s);
++        PCM_Write(*mcu.pcm, addr, value);
++        SplitCore2Release(s);
++        return;
 +    }
 +}
 +
 +// MCU thread: direct read from shared pcm state. Status reads
-+// (0x3c/0x3e, including the IRQ-ack clear) hold the state lock for
-+// the brief status computation only -- Sterr1's scope exactly.
-+// 0x3f (wave latch), voice RAM reads, latch bytes and mask commits
-+// run unlocked, exactly as in Sterr1.
++// (0x3c/0x3e, including the IRQ-ack clear) hold the state lock in the
++// BATCH/TICK modes (Sterr1's scope); in FREE/FIFO they run lock-free
++// with an atomic exchange on irq_assert. FIFO mode consults the
++// pending stores for latch reads (read-your-own-write).
 +inline uint8_t SkelPCMRead(mcu_t& mcu, uint32_t addr) {
 +    addr &= 0x3f;
++    ThreadSplitStateCircle& s = *g_splitT;
 +    if (addr == 0x3c || addr == 0x3e) {
-+        ThreadSplitStateCircle& s = *g_splitT;
-+        const uint64_t t0 = CTimer::GetClockTicks();
-+        const uint64_t c0 = PMU_ReadCycles();
-+        s.state_lock.Acquire();
-+        s.lock_wait_us = s.lock_wait_us + (CTimer::GetClockTicks() - t0);
-+        const uint64_t cDelta = PMU_ReadCycles() - c0;
-+        const uint64_t cNop = s.nop_cyc2;
-+        s.lock_wait_cyc = s.lock_wait_cyc + (cDelta >= cNop ? cDelta - cNop : 0);
-+        s.lock_waits = s.lock_waits + 1;
-+        uint8_t value = PCM_Read(*mcu.pcm, addr);
-+        s.state_lock.Release();
++        const bool bLocked = (s.sync.lock_mode == SPLIT_LOCK_BATCH || s.sync.lock_mode == SPLIT_LOCK_TICK);
++        if (bLocked)
++            SplitCore2Acquire(s);
++        uint8_t value;
++        if (s.sync.legacy_irq)
++        {
++            value = PCM_Read(*mcu.pcm, addr);
++        }
++        else
++        {
++            // PCM_Read's status branch, with the irq_assert clear as
++            // an atomic exchange (core 3 sets it with a byte store).
++            pcm_t& pcm = *mcu.pcm;
++            uint8_t status = 0;
++            if (addr == 0x3e)
++            {
++                if (__atomic_exchange_n(&pcm.irq_assert, false, __ATOMIC_ACQ_REL))
++                    MCU_Interrupt_SetRequest(mcu, INTERRUPT_SOURCE_IRQ0, 0);
++            }
++            status |= pcm.irq_channel;
++            if (pcm.voice_mask_updating)
++                status |= 32;
++            value = status;
++        }
++        if (bLocked)
++            SplitCore2Release(s);
 +        return value;
++    }
++    if (s.sync.lock_mode == SPLIT_LOCK_FIFO && s.fifo_head != s.fifo_tail_cache)
++    {
++        // Latch reads (PCM_Read's ram1/ram2 branches) see pending
++        // stores first. Index derivations are PCM_Read verbatim.
++        pcm_t& pcm = *mcu.pcm;
++        if (((addr >= 0x4 && addr < 0x10) || (addr >= 0x24 && addr < 0x30)) && (addr & 3) == 1)
++        {
++            int ix = 0;
++            if (addr & 32) ix |= 1;
++            if ((addr & 8) == 0) ix |= 4;
++            if ((addr & 4) == 0) ix |= 2;
++            uint32_t v;
++            if (s.FifoLookup(false, pcm.select_channel, static_cast<uint8_t>(ix), &v))
++            {
++                pcm.read_latch = v;
++                return 0;
++            }
++        }
++        else if (((addr >= 0x10 && addr < 0x20) || (addr >= 0x30 && addr < 0x38)) && (addr & 1) == 0)
++        {
++            int ix = (addr >> 1) & 7;
++            if (addr & 32) ix |= 8;
++            uint32_t v;
++            if (s.FifoLookup(true, pcm.select_channel, static_cast<uint8_t>(ix), &v))
++            {
++                pcm.read_latch = static_cast<uint16_t>(v);
++                return 0;
++            }
++        }
 +    }
 +    return PCM_Read(*mcu.pcm, addr);
 +}
 +
 +// Circle dispatch for the 4 PCM call sites in mcu.cpp: skeletal
-+// (MK1 only) when the split is active, direct otherwise. No
-+// interleaved branch exists on device.
++// (MK1 only) when the split is active, direct otherwise.
 +inline void SplitPCMWrite(mcu_t& mcu, uint32_t addr, uint8_t value) {
 +    if (g_splitT && mcu.is_mk1)
 +        SkelPCMWrite(mcu, addr, value);

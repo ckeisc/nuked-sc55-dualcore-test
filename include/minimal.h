@@ -21,7 +21,7 @@
 // What it is NOT: no mt32-pi code, no UI, no physical LCD, no USB,
 // no network, no LCD mirror, no OSD text (the 3-byte status protocol
 // has no text field; the MiSTer's own pop-ups on status change are
-// unchanged). The stats file (shaped-var2-stats.log) is the
+// unchanged). The stats file (shaped-var3-stats.log) is the
 // observation channel for EVERY incoming control event, logged with
 // name + parameters + timestamp; the MIDI stream itself is NEVER
 // logged (hundreds of events/s would flood).
@@ -161,7 +161,7 @@ private:
 	void PostDueEvents();	// post song events due at the current MCU cycle (NEVER logged: MIDI stream)
 	void StepUntilFill(size_t nNeed, u64* pStepUs);	// step MCU until the ring holds nNeed frames (or budget out)
 	size_t ResampleChunk(float* pOut, size_t nFrames, size_t* pSilence);	// port resampler, verbatim logic
-	void DoVariantAdvance();	// variant advance (emulator reset, E1M1 from the beginning, NO song change)
+	void DoRunAdvance();	// variant advance (emulator reset, E1M1 from the beginning, NO song change)
 	void SetSongCursor(int nSong);	// point the cursor at a song table
 	void ResetWindow();	// fresh window accumulators + counter snapshots
 	void DrainMailboxes();	// core 2: song-end + mister events + drops (chunk boundary / pause loop)
@@ -169,7 +169,9 @@ private:
 	void LogLine(const char* pFormat, ...);	// core 2 only (also init, pre-multicore), f_write+f_sync, t= prefixed
 	void WriteWindow(bool bPaused);	// core 2 only: one 5 s stats window line
 	void WriteSongEnd();	// core 2 only: per-song summary (completed)
-	void WriteSequenceDone();	// core 2 only: per-variant totals after variant 5's song_end
+	void WriteSequenceDone();	// core 2 only: terminal line after the last run's song_end
+	void WriteRunTotal();		// core 2 only: per-run totals line (at every song_end)
+	void SampleCore2Events();	// core 2 only: accumulate the PMU event counters into the window
 
 	// One PCM-task iteration (core 3, skeletal shape, UNCHANGED from
 	// togglefix): ACQUIRE-load the published cycle count; if it is
@@ -211,10 +213,10 @@ private:
 	bool m_bPaused;			// core 2 only: UNREACHABLE without keys (kept for structure; always false)
 
 	// Variant auto-sequence (2026-10-31 ~09:23/09:29). Core 2
-	// owns m_nCurrentVariant; cores 1/3 read it ONLY via __atomic
+	// owns m_nCurrentRun; cores 1/3 read it ONLY via __atomic
 	// builtins (plain field, never plain-read -- same discipline as
 	// S.cycles_pub). The variant changes ONLY while the PCM task is
-	// parked (inside DoVariantAdvance), so no batch can observe a
+	// parked (inside DoRunAdvance), so no batch can observe a
 	// mid-batch change. Per-variant totals accumulate in WriteWindow
 	// into the CURRENT variant's slot; after sequence_done they stop
 	// (idle windows still carry var=3 but do not add to the totals,
@@ -228,13 +230,24 @@ private:
 	// variants 4/5); sequence_done prints the CURRENT variants
 	// explicitly (0-3), and a follow-up adding variants extends
 	// those fields mechanically.
-	int m_nCurrentVariant;		// 0 baseline, 1 sched, 2 pipe, 3 neon2
-	bool m_bSequenceDone;		// core 2 only: last variant's song_end logged, now idle forever
-	u64 m_nVarProd[8];		// per-variant output frames (song windows only)
-	u64 m_nVarPcmCyc[8];		// per-variant pcm_cyc sums
-	u64 m_nVarMixCyc[8];		// per-variant mix_cyc sums
-	u64 m_nVarStepCyc[8];		// per-variant step_cyc sums
-	u64 m_nVarLockCyc[8];		// per-variant lock_cyc sums
+	int m_nCurrentRun;		// index into the RUN table (pcm variant x sync profile x timer mode), see g_runs in minimal.cpp
+	bool m_bSequenceDone;		// core 2 only: the last run's song_end logged, now idle forever
+	// Per-run totals (song windows only; reset at each run start,
+	// printed as the run_total line at song_end -- one line per run,
+	// so a power cut after run k still leaves runs 0..k-1 summarized).
+	u64 m_nRunProd = 0;
+	u64 m_nRunDue = 0;
+	u64 m_nRunUnderruns = 0;
+	u64 m_nRunPcmCyc = 0;
+	u64 m_nRunMixCyc = 0;
+	u64 m_nRunStepCyc = 0;
+	u64 m_nRunLockCyc = 0;
+	u64 m_nRunLockWaits = 0;
+	u64 m_nRunLockCont = 0;
+	u64 m_nRunSteps = 0;
+	u64 m_nRunTicks = 0;
+	u64 m_nRunC2Ev[4] = {0, 0, 0, 0};
+	u64 m_nRunC3Ev[4] = {0, 0, 0, 0};
 
 	// PMU handshake (core 3 sets, core 2 reads, DMB-ordered like the
 	// split handshake): m_bPmu3Done = core 3 finished its PMU
@@ -244,6 +257,24 @@ private:
 	volatile bool m_bPmu3Done;
 	volatile bool m_bPmu3Ok;
 	bool m_bPmu2Ok;
+	// Round 3: PMU EVENT counters (4 per core: INST_RETIRED,
+	// BR_MIS_PRED, L1D_CACHE_REFILL, L2D_CACHE_REFILL), validated like
+	// the cycle counter; window accumulators + snapshots; timer
+	// self-test result (boot line).
+	bool m_bPmuEv2Ok = false;
+	bool m_bPmuEv3Ok = false;
+	u32 m_nC2EvLast[4] = {0, 0, 0, 0};		// core 2: last raw 32-bit counter values
+	u64 m_nWinC2Ev[4] = {0, 0, 0, 0};		// core 2: window deltas (step loop only)
+	u64 m_nLastC3Ev[4] = {0, 0, 0, 0};		// snapshot of S.c3_ev at window start
+	u64 m_nWinSteps = 0;				// MCU steps in this window
+	u64 m_nLastTicks = 0;
+	u64 m_nLastPublishes = 0;
+	u64 m_nLastLockContended = 0;
+	u64 m_nLastIrq0Folded = 0;
+	u64 m_nLastFifoFull = 0;
+	bool m_bTimerSelfTestPass = false;
+	u64 m_nTimerSelfTestPlain = 0;
+	u64 m_nTimerSelfTestInject = 0;
 
 	// MiSTer event mailbox (single producer core 1, single consumer
 	// core 2; the MinimalRing lock makes it safe). Core 1 posts link
@@ -342,7 +373,7 @@ private:
 	// and written in the chunk epilogue, after that chunk's Write,
 	// so its totals are complete. Everything else is written
 	// directly in the epilogue context that creates it --
-	// DrainMailboxes and DoVariantAdvance run between chunks, never
+	// DrainMailboxes and DoRunAdvance run between chunks, never
 	// mid-step, so their SD-sync cost never delays stepping. Rare
 	// device lines (sound_drop, sound_restart) are written directly
 	// at the Write site: they must be 0 in a good run, and a

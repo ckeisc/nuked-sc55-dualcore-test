@@ -71,7 +71,9 @@ $(CIRCLESTDLIBHOME)/.done: $(CIRCLE_STDLIB_CONFIG)
 
 #
 # Build Nuked-SC55 (base + dual-core split patch, byte-identical to the
-# mt32-pi port's backend tree; patch md5 5d6f043cb6c5430d80b81c8472fbb954)
+# mt32-pi port's backend tree + the round-3 sync/timer changes;
+# regenerate with `git -C external/nuked-sc55 add -N . && git diff` after
+# editing the patched tree -- never edit a patched file without its hunk)
 #
 nuked: $(NUKEDBUILDDIR)/.done
 

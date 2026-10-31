@@ -48,7 +48,9 @@ class SkelRing
 public:
 	SkelRing()
 		: m_nWriteIdx(0),
+		  m_nReadIdxCache(0),
 		  m_nReadIdx(0),
+		  m_nWriteIdxCache(0),
 		  m_Data{}
 	{
 		static_assert((N & (N - 1)) == 0, "ring size must be a power of 2");
@@ -57,39 +59,57 @@ public:
 	// Producer only (core 3). Always enqueues; returns true if it
 	// had to drop the oldest frame(s) to make room (caller counts
 	// this; must stay 0 for a clean run).
+	//
+	// Round 3: the producer keeps a private copy of the consumer
+	// index and re-reads the shared one (ACQUIRE) only when the copy
+	// says the ring could be full. In the common case a sample costs
+	// one plain store + one RELEASE store, and never touches the
+	// consumer's cache line. Semantics are unchanged: the drop
+	// decision is always taken on a FRESH read.
 	bool Enqueue(const T& Item)
 	{
 		uint64_t nCur = __atomic_load_n(&m_nWriteIdx, __ATOMIC_RELAXED);
 		m_Data[nCur & BufferMask] = Item;
 		uint64_t nNext = nCur + 1;
 		bool bDropped = false;
-		uint64_t nRead = __atomic_load_n(&m_nReadIdx, __ATOMIC_ACQUIRE);
-		if ((nNext - nRead) > N)
+		if ((nNext - m_nReadIdxCache) > N)
 		{
-			// Full: advance the read index so exactly N frames
-			// remain (drop-oldest). See the header comment for
-			// the concurrent-dequeue property of this store.
-			__atomic_store_n(&m_nReadIdx, nNext - N, __ATOMIC_RELEASE);
-			bDropped = true;
+			m_nReadIdxCache = __atomic_load_n(&m_nReadIdx, __ATOMIC_ACQUIRE);
+			if ((nNext - m_nReadIdxCache) > N)
+			{
+				// Full: advance the read index so exactly N frames
+				// remain (drop-oldest). See the header comment for
+				// the concurrent-dequeue property of this store.
+				__atomic_store_n(&m_nReadIdx, nNext - N, __ATOMIC_RELEASE);
+				m_nReadIdxCache = nNext - N;
+				bDropped = true;
+			}
 		}
 		__atomic_store_n(&m_nWriteIdx, nNext, __ATOMIC_RELEASE);
 		return bDropped;
 	}
 
-	// Consumer only (core 2). Returns false when empty.
+	// Consumer only (core 2). Returns false when empty. Same private
+	// copy trick for the producer index: one ACQUIRE load per
+	// apparent-empty, not per frame.
 	bool Dequeue(T& OutItem)
 	{
-		uint64_t nWrite = __atomic_load_n(&m_nWriteIdx, __ATOMIC_ACQUIRE);
 		uint64_t nRead = __atomic_load_n(&m_nReadIdx, __ATOMIC_RELAXED);
-		if (nWrite == nRead)
-			return false;
+		if (m_nWriteIdxCache == nRead)
+		{
+			m_nWriteIdxCache = __atomic_load_n(&m_nWriteIdx, __ATOMIC_ACQUIRE);
+			if (m_nWriteIdxCache == nRead)
+				return false;
+		}
 		OutItem = m_Data[nRead & BufferMask];
 		__atomic_store_n(&m_nReadIdx, nRead + 1, __ATOMIC_RELEASE);
 		return true;
 	}
 
 	// Consumer only (core 2, step-loop fill condition): frames
-	// currently queued. Same computation as Sterr1's drain.
+	// currently queued. Same computation as Sterr1's drain. Always a
+	// fresh ACQUIRE read (the step loop calls this every
+	// ring_check_interval steps).
 	size_t Avail() const
 	{
 		uint64_t nWrite = __atomic_load_n(&m_nWriteIdx, __ATOMIC_ACQUIRE);
@@ -103,15 +123,25 @@ public:
 	void Clear()
 	{
 		m_nWriteIdx = 0;
+		m_nReadIdxCache = 0;
 		m_nReadIdx = 0;
+		m_nWriteIdxCache = 0;
 	}
 
 private:
 	static constexpr size_t BufferMask = N - 1;
 
-	uint64_t m_nWriteIdx;
-	uint64_t m_nReadIdx;
-	T m_Data[N];
+	// Round 3 layout: the producer's index (+ its private cache of the
+	// consumer index), the consumer's index (+ its cache), and the
+	// data each start on their own 64-byte line. The old layout put
+	// both indices and the first slots on ONE line, so every sample
+	// core 3 wrote invalidated the line core 2 polls, and every drain
+	// store core 2 made invalidated the line core 3 writes.
+	alignas(64) uint64_t m_nWriteIdx;	// producer-written
+	uint64_t m_nReadIdxCache;		// producer-private
+	alignas(64) uint64_t m_nReadIdx;	// consumer-written
+	uint64_t m_nWriteIdxCache;		// consumer-private
+	alignas(64) T m_Data[N];
 };
 
 // MinimalRing -- the OLD shaped kernel's locked mailbox ring, kept

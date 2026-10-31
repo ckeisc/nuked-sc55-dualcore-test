@@ -21,14 +21,16 @@ inside mt32-pi's `CNukedSC55Synth`, alongside the other engines — will land
 in [ckeisc/mt32-pi](https://github.com/ckeisc/mt32-pi) separately, once the
 design is proven here.
 
-## Status (snapshot 2026-10-31)
+## Status (snapshot 2026-10-31, round 3 sync + timer)
 
-Work in progress. This snapshot contains the auto-sequence variant runner
-(variants 0-3, see below), the PMU cycle tooling, and the MiSTer display
-wiring. Hardware verification of this exact snapshot is pending; follow-up
-commits will land as the build is verified and as further variants gate.
-Round-3 variants (split-accumulator NEON, restructured-layout NEON) are not
-in this snapshot — they join only after passing a bit-exact harness gate.
+Work in progress. This snapshot contains the RUN-table auto-sequence
+(13 runs = PCM variant x sync profile x timer mode, see below), the
+PMU cycle + event-counter tooling, the lazy-timer self-test and
+shadow-check mode, and the MiSTer display wiring. Hardware
+verification of this exact snapshot is pending. The round-3 sync/timer
+work was written without an ARM toolchain at hand; the only piece
+executed before commit is the lazy-timer self-test, built and run
+with a host compiler (see `docs/optimization-round3-sync-20261031.md`).
 
 ## Hardware and build
 
@@ -52,47 +54,76 @@ without updating its patch hunk.
 - `roms/sc55/` — your own SC-55 ROM set. The kernel scans this directory
   and hash-matches the files against the MK1 (v1.21) romset definitions.
   **No ROMs are in this repo, and none ever will be.**
-- `shaped-var-stats.log` — written by the kernel (see below).
+- `shaped-var3-stats.log` — written by the kernel (see below).
 
 ## What the kernel does on boot
 
-No keys, no input. It auto-starts E1M1 on variant 0 (baseline) and plays it
-through, then advances automatically on each song end:
+No keys, no input. It auto-starts E1M1 on run 0 (baseline) and plays it
+through, then advances automatically on each song end. A **run** is a
+(PCM_Update variant, sync profile, timer mode) triple; the table lives
+in `src/minimal.cpp` (`g_runs`), the PCM variants in `pcm.cpp`
+(`g_pcmVariants`), the sync profiles in `src/minimal.cpp`
+(`g_splitSyncProfiles`, knobs defined in `split_thread_circle.h`).
 
-| Variant | Name | What it is |
-|---|---|---|
-| 0 | baseline | Unmodified mix path (the reference) |
-| 1 | sched | Round-1 lambda-pair slot scheduling |
-| 2 | pipe | Round-2 head/tail pair split (software pipelining) |
-| 3 | neon2 | Round-2 NEON mix tail, full-width loads, no lane inserts |
+| Run | Name | PCM variant | Sync profile | Timer | What it isolates |
+|---|---|---|---|---|---|
+| 0 | base | 0 baseline | 0 legacy | legacy | the reference: shaped-var behaviour, every knob at its legacy value |
+| 1 | trim | 0 | 1 trim | legacy | sync overhead trim (padded state, raw lock, cheap lock timing, publish/8, ring check/16, IRQ0 flag, idle backoff) |
+| 2 | tick | 0 | 2 tick | legacy | + per-tick lock hand-off (core-2 wait bounded by one PCM tick) |
+| 3 | fifo | 0 | 3 fifo | legacy | + deferred-store FIFO (core 2 never waits; tick-boundary = single-threaded semantics) |
+| 4 | fifolz | 0 | 3 fifo | lazy | + event-driven timer (the core-2 compute lever) |
+| 5 | free | 0 | 4 free | legacy | no lock at all: upper bound of lock removal (EXPERIMENT, never ship) |
+| 6 | fifo32 | 0 | 5 fifo32 | legacy | publish-interval sensitivity (8 -> 32) |
+| 7 | tchk | 0 | 3 fifo | check | VALIDATION: lazy timer vs shadow legacy timer, mismatches logged (`tchk=`) |
+| 8 | schedlz | 1 sched | 3 fifo | lazy | PCM variant on the best sync + timer |
+| 9 | pipelz | 2 pipe | 3 fifo | lazy | " |
+| 10 | neon2lz | 3 neon2 | 3 fifo | lazy | " |
+| 11 | splitlz | 4 splitacc | 3 fifo | lazy | " |
+| 12 | layoutlz | 5 layout | 3 fifo | lazy | " |
 
-After variant 3's song end, the kernel stops: silence, idle windows, and a
-`sequence_done` log line carrying per-variant totals. **Silence is the done
-signal.** The LED heartbeat keeps running (a frozen LED means wedge or
-stall, never "done").
+After the last run's song end, the kernel stops: silence, idle windows,
+and a `sequence_done` line. **Silence is the done signal.** The LED
+heartbeat keeps running (a frozen LED means wedge or stall, never
+"done"). Every run's totals are written as a `run_total` line at its
+song end, so a power cut after run k still leaves runs 0..k-1 complete.
 
 The MiSTer display follows along: the Pi writes a status byte triple
-`{0xA2, 0xFF, variant}` to I2C slave `0x45` (documented minimal-kernel-only
-convention — there is no real SoundFont here, the byte carries the variant
-number), and draws `VAR n name` on the SSD1306 mirror at `0x3C`
-(best-effort, core 1 only, never in the audio path).
+`{0xA2, 0xFF, run}` to I2C slave `0x45` (documented minimal-kernel-only
+convention; the byte carries the run number), and draws `VAR nn name`
+on the SSD1306 mirror at `0x3C` (best-effort, core 1 only, never in the
+audio path).
 
 ## Log format
 
-`SD:/shaped-var-stats.log`, windows flushed every 5 s. Boot line carries
-`kernel=mt32-shaped-var` and `pmc2=ok|fail pmc3=ok|fail` (PMU counter
-validation — if a counter fails, its cycle fields report 0, never silently
-valid zeros). Window lines carry, among others:
+`SD:/shaped-var3-stats.log`, windows flushed every 5 s. Run
+`python tools/analyze_log.py SD/shaped-var3-stats.log` for the per-run
+table (cycles per MCU step, cycles per PCM tick, deltas against run 0,
+flags, timer-check verdict).
 
-- `var=N` — the variant that produced the window
-- `pcm_cyc` — core-3 PCM task cycles; `mix_cyc` — voice-mix portion
-  (accumulated per batch, not per tick, so the reads don't distort the
-  measurement)
-- `step_cyc` — core-2 MCU stepping cycles (excluding lock spins);
-  `lock_cyc` — core-2 state-lock spin cycles
-- `pct` — the real-time rate (wall-clock based); `devq_low` — device
-  queue underruns per window (the chop tell: `sound_drops`/`underruns`
-  read 0 while audio chops; `pct` + `devq_low` are the real signals)
+Boot line carries `kernel=mt32-shaped-var3`, `pmc2/pmc3=ok|fail` (PMU
+cycle counters), `pmev2/pmev3=ok|fail` (PMU event counters: instructions,
+branch mispredicts, L1D/L2 refills), and `timer_selftest=pass|FAIL` (the
+lazy timer agrees with the legacy timer on a 400k-step pseudo-random
+sequence AND the detector catches an injected one-tick event shift).
+`runlist` lines describe each run's components. Window lines carry,
+among others:
+
+- `var=N` the RUN index; `pcm= sync= timer=` its components
+- `pcm_cyc`, `mix_cyc` core-3 PCM task / voice-mix cycles; `ticks` PCM
+  ticks rendered -> `pcm_cyc/ticks` = cycles per tick (core-3 comparator)
+- `step_cyc` core-2 MCU stepping cycles (excluding lock spins); `steps`
+  MCU steps -> `step_cyc/steps` = cycles per step (core-2 comparator);
+  `lock_cyc` core-2 lock-spin cycles, `lock_waits`/`lock_cont` lock ops
+  and contended ops
+- `pubs` cycle-count publishes, `irq0` voice-end IRQs folded via the
+  flag, `fifo_hw`/`fifo_full` deferred-store FIFO high water / full waits
+  (must be 0)
+- `tchk= tchk_cmp= tchk_mism= tchk_first= tchk_code=` lazy-timer shadow
+  check (run 7 only; `off` elsewhere)
+- `c2_inst c2_brmis c2_l1d c2_l2d` / `c3_*` PMU events per core over the
+  window's work
+- `pct` the real-time rate (wall-clock based); `devq_low` device queue
+  underruns per window (the chop tell)
 
 ## Regenerating the song table
 
@@ -103,10 +134,18 @@ script to point at your files; it writes `src/songs.h`).
 
 ## Docs
 
+- `docs/optimization-round3-sync-20261031.md` — THIS round: where
+  core 2's cycles go, the sync levers (lock modes, publish interval,
+  layout, IRQ0 hand-off) and the lazy timer with their correctness
+  arguments, the run table, the validation checks and the decision
+  rules. Start here for the current kernel.
+- `docs/optimization-round3-20261031.md` — upstream round 3 (PCM
+  variants 4/5: split-accumulator and cross-slot NEON; harness gate
+  results).
 - `docs/a53-optimization-catalog.html` — every A53-relevant optimisation
   surfaced in this investigation, each with why it is or isn't relevant to
   this voice loop, what was tried, and the outcome with numbers. Searchable
-  and filterable; start here.
+  and filterable.
 - `docs/a53-execution-research-20261031.md` — the underlying research
   (A53 microarchitecture, LLVM model, FFmpeg/dav1d tricks, checkasm/PMU
   tooling).
