@@ -1469,6 +1469,17 @@ void CMinimalApp::DoRunAdvance()
 	if (m_bSplitActive)
 		StopSplitPCM();
 	m_pEmulator->Reset();
+	// Reset the emulator cycle counters together. No reset path
+	// assigns mcu.cycles or pcm.cycles (Reset covers MCU registers
+	// and the sub-MCU only), so without this every run after run 0
+	// starts with cycles already past the song end cycle: song_end
+	// fires on the first chunk, and the legacy timer loop spends
+	// ~34 s catching up ~2G cycles on its first call. Zero them
+	// before the GS_RESET post so the reset SysEx is delivered
+	// with boot ordering (cycles at 0). Resetting only mcu.cycles
+	// would strand core 3 against stale pcm.cycles.
+	m_pEmulator->GetMCU().cycles = 0;
+	m_pEmulator->GetPCM().cycles = 0;
 	m_pEmulator->PostSystemReset(EMU_SystemReset::GS_RESET);
 	const int nOld = __atomic_load_n(&m_nCurrentRun, __ATOMIC_ACQUIRE);
 	const int nNew = nOld + 1;
