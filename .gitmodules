@@ -1,0 +1,8 @@
+[submodule "external/circle-stdlib"]
+	path = external/circle-stdlib
+	url = https://github.com/smuehlst/circle-stdlib
+	ignore = dirty
+[submodule "external/nuked-sc55"]
+	path = external/nuked-sc55
+	url = https://github.com/jcmoyer/Nuked-SC55.git
+	ignore = dirty

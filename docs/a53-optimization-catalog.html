@@ -1,0 +1,469 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>A53 Optimization Catalog — mt32-pi Nuked-SC55</title><style>
+:root{--bg:#0f1419;--panel:#171e26;--panel2:#1d2733;--ink:#e8eef4;--muted:#9fb0c0;--line:#2a3644;--accent:#5ec8d8;--green:#4ade80;--amber:#fbbf24;--red:#f87171;--blue:#93c5fd}
+*{box-sizing:border-box}body{margin:0;font-family:Roboto,system-ui,-apple-system,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--ink);line-height:1.55}
+header{padding:28px 20px 18px;max-width:1100px;margin:0 auto}header h1{margin:0 0 6px;font-size:28px;line-height:1.2}
+.sub{color:var(--muted);max-width:900px}.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin:16px 0}
+.meta div{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px;font-size:14px}
+.meta strong{color:var(--accent)}
+.toolbar{position:sticky;top:0;z-index:10;background:rgba(15,20,25,.96);border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:10px 20px}
+.toolbar-inner{max-width:1100px;margin:0 auto;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.toolbar input{flex:1;min-width:180px;padding:9px 12px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--ink)}
+button.chip{padding:7px 12px;border-radius:999px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer;font-size:13px}
+button.chip.active{background:var(--accent);color:#06202a;border-color:var(--accent);font-weight:700}
+main{max-width:1100px;margin:0 auto;padding:10px 20px 40px}
+h2{margin:34px 0 12px;font-size:22px;border-bottom:2px solid var(--accent);padding-bottom:6px}
+h3{margin:0 0 10px;font-size:17px;line-height:1.35}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin:12px 0}
+.card p{margin:7px 0;font-size:15px}.card p strong:first-child{color:var(--accent)}
+code{background:#0b0f14;border:1px solid var(--line);padding:1px 5px;border-radius:5px;font-size:.88em;word-break:break-word}
+.table-wrap{overflow-x:auto;margin:12px 0}table{border-collapse:collapse;width:100%;font-size:14px;min-width:560px}
+th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}th{background:var(--panel2);color:var(--accent)}
+td{background:var(--panel)}ul,ol{margin:6px 0 10px 20px;padding:0}li{margin:4px 0}hr{border:none;border-top:1px solid var(--line);margin:28px 0}
+.count{color:var(--muted);font-size:13px;margin-left:auto}
+footer{max-width:1100px;margin:0 auto;padding:0 20px 30px;color:var(--muted);font-size:13px}
+@media(max-width:600px){header,main,.toolbar{padding-left:14px;padding-right:14px}header h1{font-size:24px}table{min-width:520px}}
+</style></head><body>
+<header><h1>A53 Optimization Catalog</h1><p class="sub">mt32-pi Nuked-SC55 on Pi Zero 2 W (Cortex-A53 @ 1&nbsp;GHz) — every A53-relevant optimization surveyed, why it does or doesn’t apply to the Nuked voice loop, what was tried, and the measured outcome. <strong>40 items: 35 relevant, 5 not relevant / do not transfer.</strong></p>
+<div class="meta"><div><strong>Target</strong><br>Pi Zero 2 W — BCM2710A1, 4× Cortex-A53 @ 1 GHz, 512 MB, bare-metal Circle</div><div><strong>Workload</strong><br>Nuked-SC55 voice loop (<code>PCM_Update</code>), 48 kHz, dual-core: MCU core 2, PCM core 3</div><div><strong>Hard constraint</strong><br>Bit-exactness — a candidate that changes audio is FAILED, never tuned to fit goldens</div><div><strong>Verdict rule</strong><br>QEMU grades correctness only. Hardware is the verdict for performance.</div></div></header>
+<div class="toolbar"><div class="toolbar-inner"><input id="q" type="search" placeholder="Search items — e.g. NEON, prefetch, split accumulator…"><button class="chip active" data-f="all">All</button><button class="chip" data-f="relevant">Relevant</button><button class="chip" data-f="not applicable">Not relevant</button><button class="chip" data-f="tried">Tried</button><button class="chip" data-f="queued">Queued</button><button class="chip" data-f="in progress">In progress</button><button class="chip" data-f="design only">Design only</button><span class="count" id="count"></span></div></div>
+<main><h1>A53 Optimization Catalog — mt32-pi Nuked-SC55</h1>
+<p><strong>Target:</strong> Pi Zero 2 W — Broadcom BCM2710A1 (same silicon as Pi 3), 4× Cortex-A53 @ 1 GHz, 512 MB LPDDR2, bare-metal Circle kernel.</p>
+<p><strong>Workload:</strong> Nuked-SC55 voice loop (<code>PCM_Update</code> slot loop, <code>pcm.cpp</code>), 48 kHz real-time audio, dual-core split (MCU on core 2, PCM on core 3), JV880-shape sync.</p>
+<p><strong>Hard constraint:</strong> bit-exactness. A candidate that changes audio output is FAILED, never tuned to fit goldens. Goldens: E1M1 164,997,213 steps / 164 checkpoints; BELMO 441,939,679 steps / 441 checkpoints; prefix = truncated E1M1, first 30 s + 3 s tail, 54,999,240 steps / 54 checkpoints. Gate: E1M1 ONLY since 2026-10-31 ~07:57 (BELMO dropped until 100% on one song; full E1M1 still required for engine-semantics claims).</p>
+<p><strong>Standing rule:</strong> QEMU grades correctness only. Hardware (shape-kernel pct + variant-kernel cycle counts) is the verdict for performance. Never present a model estimate as a Pi percentage.</p>
+<h2>Baseline (what everything is measured against)</h2>
+<p>Step-4 harness attribution (QEMU plugin counts, truncated E1M1 prefix): total 40,831,173,616 insns (step-4 total 40,831,173,458; +158 negligible), host wall 55.451 s (TCG-caveated, never a grade). PCM 53.26% of insns (PCM_Update 43.21%, PCM_ReadROM 5.91%, calc_tv 4.04%); MCU 42.42% (TIMER_Clock 18.90%). Engine work drops 5.78% in the split; prototype sync overhead (22.54%) does NOT transfer to the JV880 shape (state lock only). Binding core on Pi is core 2 (98–99% step-loop wall) vs core 3 at 73–75%, with ~39 points unexplained by engine work — lock spins vs MCU-insn premium vs core-2 extras. Shape runs: 83–88% of real time with DMA zero-fill chop (~1.1 ms silence per ~6.4 ms chunk, ~156 Hz); sound is correct pitch/notes/resampler — a pure speed gap.</p>
+<p>Sources: <code>hidden_files/optimization-20261031.md</code> §0–1, <code>hidden_files/hotblocks-step4-20261031.md</code>, MEMORY.md mt32-pi section.</p>
+<h2>Status legend</h2>
+<ul>
+<li><strong>TRIED</strong> — built in the harness, gated, measured. Verdict follows.</li>
+<li><strong>QUEUED</strong> — green but model-negative or otherwise waiting on a hardware run.</li>
+<li><strong>DESIGN ONLY</strong> — designed, never implemented.</li>
+<li><strong>IN PROGRESS</strong> — round 3 work, correctness gate pending.</li>
+<li><strong>AWAITING RUN</strong> — built kernel, the hardware run pending.</li>
+<li><strong>NOT TRIED</strong> — named in research, never attempted.</li>
+<li><strong>NOT APPLICABLE / DO NOT TRANSFER</strong> — does not apply to this target or loop.</li>
+</ul>
+<h2>Summary verdicts</h2>
+<h3>Part A — Microarchitecture facts (all RELEVANT context)</h3>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Fact</th><th>Why it matters here</th></tr></thead><tbody>
+<tr><td>A1</td><td>In-order, partial dual-issue</td><td>Scheduling, not width, is the core&#x27;s real 2× lever</td></tr>
+<tr><td>A2</td><td>NEON latency ~2–3 cycles; chains stall</td><td>Voice chains are sequential; naive NEON stalls at full latency</td></tr>
+<tr><td>A3</td><td>No gather</td><td>Fetch head stays scalar; split loop on fetch/mix boundary</td></tr>
+<tr><td>A4</td><td>64-bit load path / 128-bit store path</td><td>Loading vectors is load-bandwidth-bound before compute</td></tr>
+<tr><td>A5</td><td>Single AGU (1 load OR store / cycle)</td><td>Load-heavy loop is AGU-bound as much as ALU-bound</td></tr>
+<tr><td>A6</td><td>128-bit NEON ops occupy both 64-bit halves</td><td>64-bit vectors sometimes schedule better than 128-bit</td></tr>
+<tr><td>A7</td><td>Memory latency unhidden (L1 4 / L2 10–12 / DRAM ~150; mispredict 7–10)</td><td>ROM-fetch locality and prefetch matter more than ALU width</td></tr>
+<tr><td>A8</td><td>No public A53 timing doc; A55 guide is the prior</td><td>A55 tables = strong prior; A53 measurements arbitrate</td></tr>
+<tr><td>A9</td><td>Icache effects of code growth (unmodeled)</td><td>Pipe 1.9× / neon2 code growth could cost on hardware; model has no icache</td></tr>
+</tbody></table></div>
+<h3>Part B — FFmpeg/dav1d code tricks</h3>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Trick</th><th>Relevance</th><th>Status</th></tr></thead><tbody>
+<tr><td>B1</td><td>Same-register accumulation (forwarding path, ~40% on A53/A55/A520)</td><td>RELEVANT</td><td>In our code by construction (serial sum); NEON split form IN PROGRESS (round 3)</td></tr>
+<tr><td>B2</td><td>Multiple independent accumulators (chain-breaking)</td><td>RELEVANT (hypothesis)</td><td>NOT TRIED as scalar change; NEON split form IN PROGRESS (round 3)</td></tr>
+<tr><td>B3</td><td>Tree reduction vs serial chain</td><td>RELEVANT, BLOCKED by bit-exactness</td><td>NOT TRIED (would break the serial addclip20 sum)</td></tr>
+<tr><td>B4</td><td>Partial-load fix (LD1R replicate / zeroing; 3× in dav1d)</td><td>RELEVANT</td><td>TRIED in spirit: v1 INS/UMOV is the trap; v2 moved to full-width loads — still lost</td></tr>
+<tr><td>B5</td><td>Load-first vs defer-load</td><td>RELEVANT</td><td>TRIED: both orders measured (baseline vs pipe) — neither wins</td></tr>
+<tr><td>B6</td><td>Post-increment pointer dependencies</td><td>RELEVANT</td><td>TRIED (audit): NO-OP — zero post-increment loads in hot path</td></tr>
+<tr><td>B7</td><td>Hand-interleaved software pipelining</td><td>RELEVANT</td><td>TRIED (pipe pair split): GREEN but model-negative</td></tr>
+<tr><td>B8</td><td>Prefetch + layout</td><td>RELEVANT</td><td>DESIGN ONLY — shared-helper implementation queued</td></tr>
+<tr><td>B9</td><td>Runtime dispatch / per-CPU micro-kernels</td><td>NOT APPLICABLE</td><td>Single-core target; no dispatch needed</td></tr>
+<tr><td>B10</td><td>Don&#x27;t copy x86 control flow</td><td>NOT APPLICABLE</td><td>Native AArch64 code; warning only</td></tr>
+<tr><td>B11</td><td>SVE</td><td>NOT APPLICABLE</td><td>No SVE on A53; NEON is the only vector path</td></tr>
+</tbody></table></div>
+<h3>Part C — Our-loop candidates</h3>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Candidate</th><th>Gate</th><th>Grade</th><th>Verdict</th></tr></thead><tbody>
+<tr><td>C1</td><td>NEON intrinsics</td><td>GREEN but vacuous (0 vector insns)</td><td>n/a</td><td>NOT A ROUTE — GCC scalarizes</td></tr>
+<tr><td>C2</td><td>NEON mix-tail v1, 64-bit asm</td><td>GREEN (prefix)</td><td>+1.68% insns</td><td>REJECTED (cost) — hardware verdict via variant 3 pending</td></tr>
+<tr><td>C3</td><td>NEON mix-tail v1, 128-bit asm</td><td>GREEN (prefix)</td><td>+1.68% insns</td><td>REJECTED (cost) — width insn-neutral</td></tr>
+<tr><td>C4</td><td>NEON mix-tail v2, full-width loads</td><td>GREEN (prefix)</td><td>+2.29% insns</td><td>DEPRIORITIZED, not disproven — variant 3 (neon2) settles it on hardware</td></tr>
+<tr><td>C5</td><td>Split-accumulator NEON</td><td>PENDING</td><td>—</td><td>IN PROGRESS (round 3, variant 4/5) — sx20 reordering risk</td></tr>
+<tr><td>C6</td><td>Restructured-layout NEON</td><td>PENDING</td><td>—</td><td>IN PROGRESS (round 3, variant 4/5) — removes per-tick packing</td></tr>
+<tr><td>C7</td><td>Lambda-pair scheduling (sched)</td><td>GREEN (prefix + full E1M1 + full BELMO)</td><td>Model +0.09%</td><td>QUEUED for HW A/B — variant 1</td></tr>
+<tr><td>C8</td><td>Head/tail pair split (pipe)</td><td>GREEN (prefix + full E1M1)</td><td>Model +0.19%</td><td>QUEUED, low priority — variant 2 (sched outranks)</td></tr>
+<tr><td>C9</td><td>GCC <code>#pragma unroll 2</code></td><td>n/a (no code change)</td><td>—</td><td>DEAD — unroller refuses the body</td></tr>
+<tr><td>C10</td><td>TIMER_Clock closed form</td><td>FAILED (2 prefix + 2 boot failures)</td><td>Caps ~1% even if fixed</td><td>DEAD</td></tr>
+<tr><td>C11</td><td>PCM_ReadROM inlining (item-4)</td><td>Measured safe</td><td>−0.76%</td><td>MEASURED, not yet in split (branch <code>feature/nuked-sc55-optimization</code>, <code>f8a0a2e</code>)</td></tr>
+</tbody></table></div>
+<h3>Part D — Methodology (all RELEVANT — they govern every number above)</h3>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Method</th><th>Status</th></tr></thead><tbody>
+<tr><td>D1</td><td>Measure-or-don&#x27;t-submit (checkasm discipline)</td><td>ADOPTED — our verify + measure pairing mirrors it</td></tr>
+<tr><td>D2</td><td>PMU cycle tooling in the variant kernel (PMCCNTR_EL0, NOP-calibrated, boot-validated)</td><td>BEING BUILT — variant kernel in progress</td></tr>
+<tr><td>D3</td><td>PMU phase-2 event counters (instructions / L1D refill / mispredict → IPC + stall attribution)</td><td>PROPOSED, not built</td></tr>
+<tr><td>D4</td><td>QEMU insn-count limits (counts ≠ wall; no cache model; TCG distortion)</td><td>ESTABLISHED — correctness-only for NEON</td></tr>
+<tr><td>D5</td><td>llvm-mca A53 limits (NEON complaints reproduce; scalar parts pass)</td><td>ESTABLISHED — never the scheduling grade</td></tr>
+<tr><td>D6</td><td>Bit-exact gate discipline</td><td>ABSOLUTE — failing candidate is FAILED, goldens never tuned</td></tr>
+<tr><td>D7</td><td>Diag-kernel gating measurement (lock_us / mcu_us split)</td><td>AWAITING RUN — diag kernel built, run pending</td></tr>
+</tbody></table></div>
+<h3>Part E — Does not transfer</h3>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Item</th><th>Why not</th></tr></thead><tbody>
+<tr><td>E1</td><td>FFmpeg video block / streaming shapes</td><td>Our loop is short, branchy, per-voice stateful with a 128-tick batch bound — not a streaming block loop</td></tr>
+<tr><td>E2</td><td>dav1d/FIR headline numbers (3×, 3.37×, 40%) as predictions</td><td>They are priors and candidate shapes, not expected gains for our loop</td></tr>
+</tbody></table></div>
+<p><strong>Counts: 40 items total — 35 relevant (A9 + B8 + C11 + D7), 5 not relevant / do not transfer (B9–B11 + E1–E2).</strong></p>
+<hr>
+<h2>Part A — Microarchitecture facts (Cortex-A53 @ 1 GHz, BCM2710A1)</h2>
+<article class="card"><h3>A1 — In-order, partial dual-issue — RELEVANT</h3>
+
+<p><strong>What it is.</strong> A53 executes strictly in order and issues two instructions per cycle ONLY when they are independent and use different pipes. It cannot skip over a stalled instruction.</p>
+<p><strong>Relevance.</strong> This is the core&#x27;s real 2× lever, and it is a scheduling lever, not a width lever. Badly ordered code stalls at full latency; well-ordered code wins big. Every scheduling candidate in Part C exists because of this fact.</p>
+<p><strong>Tried.</strong> Indirectly, via C7 (lambda-pair) and C8 (pipe pair split) — both attempts to create dual-issue pairs across slot boundaries.</p>
+<p><strong>Outcome.</strong> Both model-negative (C7 +0.09%, C8 +0.19% cycles). The fact itself stands: the lever is real, but our slot body is fragmented by switches and branches into small basic blocks, so pair structures do not create larger scheduling regions.</p>
+<p>Source: <code>hidden_files/a53-execution-research-20261031.md</code> (Traps §1), <code>hidden_files/optimization-20261031.md</code> §3, <code>hidden_files/optimization-round2-20261031.md</code> §2.</p>
+</article>
+<article class="card"><h3>A2 — NEON latency ~2–3 cycles; dependency chains stall — RELEVANT</h3>
+
+<p><strong>What it is.</strong> Only VEOR was observed at 1-cycle latency; typical NEON ops are ≥2 cycles, and fmul→fadd chains stall ~3 cycles.</p>
+<p><strong>Relevance.</strong> Per-voice envelope/phase/accumulator chains are sequential, so naive NEON vectorization of the voice loop stalls at full latency. Fix candidates: multiple independent accumulators, interleaved voices — helps scalar and NEON alike.</p>
+<p><strong>Tried.</strong> NEON mix-tail candidates C2–C4 keep the serial accumulation chain scalar and in order (deliberately); the chain-breaking alternative is round-3 item C5.</p>
+<p><strong>Outcome.</strong> The latency cost is part of why NEON mix-tail regressions would be worse on A53 wall time than the insn deltas suggest (NEON ops cost 2–3 cycles, and the volatile-asm blocks are barriers).</p>
+<p>Source: research file (Traps §2), round-1 report §2.</p>
+</article>
+<article class="card"><h3>A3 — No gather — RELEVANT</h3>
+
+<p><strong>What it is.</strong> NEON has no gather instruction. Gathering per-voice data from scattered addresses requires scalar loads + lane packing (INS/TBL).</p>
+<p><strong>Relevance.</strong> Our voice loop fetches wave ROM per voice by phase — random access, per-voice pointers. Vectorizing the fetch head requires scalar loads + lane packing, and that pack overhead typically eats the vector gain. Consequence, applied in every NEON candidate: the fetch/envelope head stays scalar; only the mix/accumulate tail (streaming, sequential, independent lanes) is NEON-shaped. Split the loop on that boundary; do not vectorize it whole.</p>
+<p><strong>Tried.</strong> All NEON candidates C2–C4 implement exactly this split (mix tail only, head scalar).</p>
+<p><strong>Outcome.</strong> Even the tail-only shape loses, because the tail&#x27;s inputs are still scattered scalars that must be packed per slot-tick (see C4 lesson).</p>
+<p>Source: research file (Traps §3, Consequences), round-1 report §2.</p>
+</article>
+<article class="card"><h3>A4 — 64-bit load path / 128-bit store path asymmetry — RELEVANT</h3>
+
+<p><strong>What it is.</strong> <code>ldr q0</code> takes 2 cycles to issue and does not dual-issue; multi-register loads take 2 cycles per register. Stores are 1 cycle per register and can dual-issue with non-NEON work. (TRM-documented.)</p>
+<p><strong>Relevance.</strong> Loading voice data into vectors is load-bandwidth-bound even before compute. This is why the full-width-load shape (C4) was attempted — and why its failure is informative: even with full-width loads, the cost of building the vector to load dominates.</p>
+<p><strong>Tried.</strong> C4 (full-width <code>ldr q1</code>/<code>ldr q2</code>) vs C2–C3 (lane-insert construction).</p>
+<p><strong>Outcome.</strong> Full-width loads did NOT win: pack construction ≈ 20 insns vs 8 insns for lane inserts. The asymmetry matters, but it is not the binding constraint — pack construction is.</p>
+<p>Source: research file (Traps §4), round-2 report §1.</p>
+</article>
+<article class="card"><h3>A5 — Single AGU: one load OR store per cycle — RELEVANT</h3>
+
+<p><strong>What it is.</strong> No dual-issue of load+store, or of two 64-bit stores. One load/store unit total.</p>
+<p><strong>Relevance.</strong> The voice loop is load-heavy (ROM fetch + voice state + envelope tables), so it is AGU-bound as much as ALU-bound. Any candidate that adds memory traffic (PipeCtx stack round-trips in C8, spill/reload traffic around volatile-asm blocks in C2–C4) pays directly against this single unit.</p>
+<p><strong>Tried.</strong> Modeled in the A53 cycle model used for C7/C8 (1 LS/cycle); the C8 mechanism analysis cites PipeCtx stack traffic as pure added cost against this constraint.</p>
+<p><strong>Outcome.</strong> C8 stall cycles actually fell (−12,472) but total cycles rose — added instructions cost more dual-issue slots than the reorder saves, consistent with AGU pressure from the added stack traffic.</p>
+<p>Source: research file (Traps §5), round-2 report §2.</p>
+</article>
+<article class="card"><h3>A6 — 128-bit NEON ops occupy both 64-bit halves — RELEVANT</h3>
+
+<p><strong>What it is.</strong> A full-width NEON op blocks all other NEON work that cycle; two 64-bit-half ops on independent registers CAN dual-issue. Counterintuitive consequence: 64-bit vectors (4×16-bit samples) sometimes schedule better than 128-bit vectors (8×16-bit).</p>
+<p><strong>Relevance.</strong> Both widths must be tested, not assumed — which is what round 1 did.</p>
+<p><strong>Tried.</strong> C2 (64-bit, 4× <code>mul v0.2s</code>) vs C3 (128-bit, 3× <code>mul v0.4s</code>).</p>
+<p><strong>Outcome.</strong> Width is insn-neutral here: totals differ by 11 insns (41,518,178,621 vs 41,518,178,610, both +1.68%). The bottleneck is packing + barriers, not vector width.</p>
+<p>Source: research file (Traps §6), round-1 report §2.</p>
+</article>
+<article class="card"><h3>A7 — Memory latency cannot be hidden (no out-of-order) — RELEVANT</h3>
+
+<p><strong>What it is.</strong> L1 hit 4 cycles, L2 10–12, DRAM ~150 cycles; branch mispredict ~7–10 cycles. An in-order core has nothing else to run during a miss.</p>
+<p><strong>Relevance.</strong> Wave ROM tables are megabytes, so a voice fetch missing the caches stalls the core for ~150 cycles. ROM-fetch locality matters more than ALU width. Software prefetch of the next tick&#x27;s ROM data, issued early, is a real lever precisely because it does not depend on dual-issue at all.</p>
+<p><strong>Tried.</strong> Not directly — prefetch is B8 (design only). The counter-consideration (per-voice ROM reads advance slowly, so the current region is overwhelmingly L1-resident at ~4-cycle exposed latency, not DRAM ~150) is why B8&#x27;s expected hardware gain is small.</p>
+<p><strong>Outcome.</strong> Unmeasured. The latency numbers themselves come from AsiaBSDcon 2026 notes and A53 microbenchmark folklore, not from Pi measurements — Pi-specific cache config is unknown (see Unmapped below).</p>
+<p>Source: research file (Traps §7), round-2 report §3.</p>
+</article>
+<article class="card"><h3>A8 — No public A53 timing doc; the A55 guide is the prior — RELEVANT (context)</h3>
+
+<p><strong>What it is.</strong> ARM never published an A53 Software Optimization Guide (NDA only); the A53-specific spreadsheet is still not public. The public transferable source is ARM&#x27;s Cortex-A55 Software Optimization Guide (ARM-EPM-128372, Non-Confidential since issue 2.0, Jan 2018; issue 4.0, Aug 2022, r2p0, 48 pp.).</p>
+<p><strong>Relevance.</strong> The A55 retains most of the A53 backend (same 2-wide in-order formula, 8-stage integer pipeline, inherited backend, robust dual-issue), so A55 tables are the closest thing to an official A53 timing doc — but transfer caveats are measured, not assumed: SMLAL.int8 + 64-bit load = 0.97 IPC on A53 vs 1.72 on A55; A55 has a predecoded I-cache and perceptron predictor vs A53&#x27;s GShare, so branch/frontend behavior does not transfer; the A55 guide even contradicts itself on SMLAL dual-issue slots. Rule: A55 tables = strong prior, A53 measurements arbitrate conflicts.</p>
+<p><strong>Tried.</strong> Used as background for the hand-built A53 cycle model (<code>a53sim.py</code>: in-order dual-issue, 2/cycle, 1 LS/cycle, ALU 1, mul 3, NEON 3, load→use 4 L1, mem RAW exact-addr +1, branches consume a slot, no mispredict penalty). The model itself was built from microbenchmark timings, NOT directly from A55 tables — the tables remain an unused prior (see Unmapped).</p>
+<p><strong>Outcome.</strong> Ranking-grade estimates only (C7 +0.09%, C8 +0.19%); hardware A/B is ground truth.</p>
+<p>Source: research file (App. 2, &quot;has understanding improved?&quot;), round-1 NOTES.md (model description).</p>
+</article>
+<article class="card"><h3>A9 — Instruction-cache effects of code growth — RELEVANT, UNMEASURED</h3>
+
+<p><strong>What it is.</strong> Larger code footprints can cost instruction-cache misses. The A53 cycle model has no icache; QEMU/TCG has no cache model either.</p>
+<p><strong>Relevance.</strong> Pipe grows PCM_Update 0x2584 → 0x4ab0 (~1.9×); neon2 grows it to 0x2640; sched grows it to 0x37b4 (+0x1230). None of these growth costs appear in any harness number. A hardware run could differ from the model adversely for this reason alone.</p>
+<p><strong>Tried.</strong> Nothing — no icache measurement exists in the harness or in any kernel.</p>
+<p><strong>Outcome.</strong> NOT MEASURED. Flagged as an icache consideration in both round reports; only the variant-kernel hardware run can show it.</p>
+<p>Source: round-1 report §3, round-2 report §2 and &quot;What the harness cannot measure&quot;.</p>
+</article>
+<hr>
+<h2>Part B — FFmpeg/dav1d code tricks (VDD26, Martin Storsjö + commit history)</h2>
+<p>Source for all of Part B: research file Appendix 3 (VideoLAN Developer Days 2026, Rome, Oct 18; talk report: Tokyo Video Tech, Medium, Part 3) and Appendix 2 (FFmpeg finding, Oct 2026).</p>
+<article class="card"><h3>B1 — Same-register accumulation (A53/A55/A520 forwarding path) — RELEVANT</h3>
+
+<p><strong>What it is.</strong> These cores have a dedicated forwarding path passing the previous accumulation result straight to the next instruction. Accumulating into the SAME register is ~40% faster on A53/A55/A520 than alternating registers (at ~1% cost on out-of-order cores). A510 LACKS the path — irrelevant here, since our target is exactly one core.</p>
+<p><strong>Relevance.</strong> This reverses the naive chain-breaking instinct. Our code ALREADY accumulates serially into <code>ram1[31][1]/[3]</code> and <code>rcsum</code> (single-accumulator shape by construction). The open question was whether a revived NEON mix-tail should keep one accumulator or split it — round 2 kept one (per the brief); the split form is round-3 item C5. Caveat from the research: the 40% is an FIR/scalar-accumulation finding; whether it extends to NEON fadd mix accumulators is UNMEASURED — test both styles on hardware.</p>
+<p><strong>Tried.</strong> Single-accumulator shape used in C4 (round-2 NEON v2, per brief). The split-accumulator NEON variant was NOT attempted in round 2 (serial sum preserved by design).</p>
+<p><strong>Outcome.</strong> C4 lost for unrelated reasons (pack cost, +2.29% insns) — the accumulator-shape question itself is still open and is exactly what C5 tests.</p>
+<p>Source: research file (App. 3, trick 1; App. 2, consequence), round-2 report §1.</p>
+</article>
+<article class="card"><h3>B2 — Multiple independent accumulators (chain-breaking) — RELEVANT (hypothesis)</h3>
+
+<p><strong>What it is.</strong> Breaking a serial accumulation chain across two or more alternating registers so independent accumulations can dual-issue / hide latency. Standard advice on most cores.</p>
+<p><strong>Relevance.</strong> Plausible in general, but B1&#x27;s forwarding path means it may LOSE on A53 for accumulation chains — do NOT assume multi-accumulator wins (contra the naive instinct). For our loop the serial chain is also bit-exactness-constrained (see B3), so a scalar multi-accumulator rewrite was never attempted; the NEON split-accumulator form is round-3 item C5.</p>
+<p><strong>Tried.</strong> Not tried as a scalar change. NEON split-accumulator form: IN PROGRESS (round 3).</p>
+<p><strong>Outcome.</strong> NOT MEASURED in any form yet. The two styles must be measured on the Pi, not assumed.</p>
+<p>Source: research file (Traps §2, App. 3 trick 1 + mapping §3).</p>
+</article>
+<article class="card"><h3>B3 — Tree reduction vs serial chain — RELEVANT, BLOCKED by bit-exactness</h3>
+
+<p><strong>What it is.</strong> Adding x0..x7 serially is a 7-deep chain; a tree reduction is 3 steps — on out-of-order cores. On A53/A55 the forwarding path (B1) reverses this preference.</p>
+<p><strong>Relevance.</strong> Our mix sum MUST stay serial: the serial addclip20 sum into <code>ram1[31]</code>/<code>rcsum</code> is order-sensitive because intermediate sums wrap when re-read through <code>sx20</code> — reordering partial sums is NOT semantics-preserving in general. A tree reduction would change audio output and fail the bit-exact gate. The safe shape (used in C8) is interleaved FETCH + per-voice work with the serial sum kept in order.</p>
+<p><strong>Tried.</strong> Not tried — blocked by construction, not by measurement.</p>
+<p><strong>Outcome.</strong> NOT TRIED, and not recommended: any tree form would have to pass the bit-exact gate first, and the gate is the only thing that could save it.</p>
+<p>Source: research file (App. 3, tree-reduction note + mapping §2), round-1 report §2, round-2 report §2.</p>
+</article>
+<article class="card"><h3>B4 — Partial-load fix: LD1R replicate / zeroing (3× in dav1d) — RELEVANT</h3>
+
+<p><strong>What it is.</strong> Where four bytes suffice, a load into PART of a 16-byte register leaves the rest unchanged, creating an implicit dependency on whatever the previous iteration wrote there. Replacing it with a load that REPLICATES the four bytes across the register (LD1R) or one that ZEROES the remainder lets the next iteration start immediately. One-instruction change: 3× faster in dav1d (combined with trick B5: 3.37×).</p>
+<p><strong>Relevance.</strong> Our rejected NEON mix-tail used INS (pack) + UMOV (unpack) per bundle — exactly the dependency-creating lane operations this trick avoids. Any future NEON attempt must prefer full-width loads over lane inserts and keep the accumulate in full registers. Scalar GPR note: AArch64 W-register writes zero-extend, so scalar code has no equivalent partial-register trap — this trap is NEON-specific. Core attribution caveat: the 3× is NOT pinned to A53 specifically in the talk report — do not quote it as an A53 number (see E2).</p>
+<p><strong>Tried.</strong> C2–C3 (v1, INS/UMOV construction) and C4 (v2, full-width <code>ldr q1</code>/<code>ldr q2</code> construction — the trick applied).</p>
+<p><strong>Outcome.</strong> The trick did NOT save the shape: v2 was WORSE than v1 (+2.29% vs +1.68% insns). Lesson (round-2 report): the full-width-load trick pays only when data is ALREADY in memory — for computed scalars, building a memory vector to load it back is strictly more work than inserting lanes. The trap diagnosis was right; the remedy&#x27;s precondition (data already in memory) is what our loop violates — which is why C6 (restructured layout) exists.</p>
+<p>Source: research file (App. 3, trick 3 + mapping §1), round-2 report §1.</p>
+</article>
+<article class="card"><h3>B5 — Load-first vs defer-load — RELEVANT</h3>
+
+<p><strong>What it is.</strong> dav1d 8-pixel function: the old code started from a value already at hand and deferred the slow load; Arm&#x27;s suggestion was the opposite (start the slow load FIRST, insert another instruction, then use the loaded value). Result: a few % SLOWER on efficiency cores, 9–13% faster on large cores.</p>
+<p><strong>Relevance.</strong> For an A53-only target the direction inverts: deferring the load (the old shape) is the better bet — but the real lesson is that the optimal schedule differs by core class, so both orders must be measured on the Pi, not assumed. FFmpeg doctrine generally: &quot;issue independent loads first, then line up the calculations that use them&quot;; &quot;in simple functions, unrolling the loop is needed to give the CPU more independent data.&quot;</p>
+<p><strong>Tried.</strong> Both orders measured in our loop: the original order (tail(s) before head(s+1)) IS the baseline (4,286,700 model cycles); the pair order (head(s+1) before tail(s)) is C8 (4,294,669).</p>
+<p><strong>Outcome.</strong> Neither wins (+0.19% for the pair order). There is no third order to test: an all-heads-before-all-tails shape would break IRQ order (heads must stay in slot order, which the pair shape preserves) and would still not lengthen any load→use distance.</p>
+<p>Source: research file (App. 3, trick 2 + mapping §2), round-2 report §2.</p>
+</article>
+<article class="card"><h3>B6 — Post-increment pointer dependencies — RELEVANT</h3>
+
+<p><strong>What it is.</strong> A load with post-increment makes the next instruction using the advanced pointer wait, and so must calculations using the loaded data. Remedies: separate base registers for even/odd rows with doubled stride, or alternate x2 vs x2+x3 and advance x2 at the end (more instructions, faster on large cores).</p>
+<p><strong>Relevance.</strong> The voice loop advances per-voice phase pointers; a post-increment load in the hot loop would make the next pointer use wait. Advance at loop end or use even/odd base registers.</p>
+<p><strong>Tried.</strong> Round-2 audit (D): baseline <code>PCM_Update</code> disassembly examined.</p>
+<p><strong>Outcome.</strong> NO-OP — exactly one post-index instruction exists (function-epilogue <code>ldp x29, x30, [sp], #352</code>) and one pre-index (prologue <code>stp x29, x30, [sp, #-352]!</code>); ZERO post-increment loads in the hot path. GCC already avoids them here. No variant built, nothing to grade. DEAD as a direction (not a failure — the audit found the code already in the desired shape).</p>
+<p>Source: round-2 report §4, round-2 NOTES.md (D section).</p>
+</article>
+<article class="card"><h3>B7 — Hand-interleaved software pipelining — RELEVANT</h3>
+
+<p><strong>What it is.</strong> Hand-written asm that interleaves two independent streams: fetch voice N+1&#x27;s ROM data while mixing voice N. FFmpeg&#x27;s doctrine applied: insert independent work between a load and its first use; &quot;code with broken dependency chains runs faster than code that looks tidy&quot;; macros reduce scheduling freedom, so interleave separate calculations with comments instead.</p>
+<p><strong>Relevance.</strong> Ranked in the research as the STRONGEST untested candidate class for the voice loop — because the round-1 sched candidate failed only in that GCC fragments basic blocks and the slot body is switch-heavy, while hand interleaving changes order across voices (legal here: voices are independent until the final mix sum, and the sum order must be preserved). This is NOT the same as the lambda-pair experiment (which kept execution order identical).</p>
+<p><strong>Tried.</strong> C8 (round-2 pipe pair split): each pair of slots runs head(s), head(s+1), tail(s), tail(s+1); head = per-slot setup → address gen → 4 ROM fetches → DPCM → interpolation → filter → IRQ check; tail = calc_tv ×3 → mix tail → sums → key update → !active cleanup. Serial addclip20 sum kept in order; 7-field PipeCtx (v3, usenew, newnibble, old_nibble, key, kon, active); surgery script <code>cand-pipe/split-loop.py</code> (mechanical, assertion-checked); loop at <code>pcm.cpp:1105</code>, head lines 1107..1458, tail 1459..1577.</p>
+<p><strong>Outcome.</strong> GREEN (prefix + full E1M1, 164,997,213 steps, 164 checkpoints, 0 failures) but model +0.19% cycles (4,294,669 vs 4,286,700; CPI 0.8589 vs 0.8573; stall −12,472 but total up) — NO MODELED GAIN, slightly negative, and mechanism-negative: load→use distances WITHIN each head are unchanged by the split (each head&#x27;s fetches are still immediately followed by its own DPCM/interp/filter uses); calc_tv calls and IRQ/filter branches block GCC&#x27;s scheduler from moving work across the new boundaries; on an in-order core, reordering alone creates no overlap — only longer load→use distances do, and the split does not lengthen any. What it adds is cost: PipeCtx zero-init + stack round-trips + pair-loop control, plus ~1.9× code growth (icache note, A9). QUEUED for hardware A/B ONLY as a low-priority check (variant 2); round-1 sched (+0.09%, smaller code growth) outranks it. A deeper 3–4 voice interleave was NOT attempted; the same mechanism analysis applies a fortiori, but that is unmeasured (see Unmapped).</p>
+<p>Source: research file (App. 3, doctrine + mapping §2), round-2 report §2, round-2 NOTES.md (B section).</p>
+</article>
+<article class="card"><h3>B8 — Prefetch + layout — RELEVANT</h3>
+
+<p><strong>What it is.</strong> On an in-order core a cache miss (~150 cycles DRAM) has nothing to hide behind, so prefetching next tick&#x27;s ROM data early, issued ahead of use, is the one scheduling lever that does not depend on dual-issue at all. (OpenBLAS lesson, already in our plan; wave ROM tables are MBs.)</p>
+<p><strong>Relevance.</strong> Real lever in principle; small expected gain in practice for our loop (see below).</p>
+<p><strong>Tried.</strong> DESIGN ONLY — never implemented, for three stated reasons: (1) the only non-no-op prefetch points (cross-slot samp0, cross-tick samp0) require computing a HOST pointer from a ROM address, and PCM_ReadROM (<code>pcm.cpp:33</code>) maps ROM→host through a ~30-line bank/mode switch (config_reg_3d bit 0x20 selects the bank shift; MK1/JV880 variants per bank; waverom1/2/3/card/exp) — a prefetch would have to replicate that switch, a duplicated mapping that must track future ReadROM changes, for a hint; (2) the harness CANNOT measure any cache effect (TCG has no cache model), so an implementation would be gradeable only as &quot;still bit-exact + added insn cost&quot; — which proves nothing about the gain; (3) expected hardware gain is small anyway: per-voice ROM reads advance slowly through wave data, so the current region is overwhelmingly L1-resident (~4-cycle exposed latency, not DRAM ~150). The in-loop alternative (prefetch the current slot&#x27;s fetches right before their calls) is a no-op: prefetch→load distance ~0.</p>
+<p><strong>Outcome.</strong> DESIGN ONLY, queued as a hardware-design note. Clean implementation if a future HW A/B wants it: cross-tick samp0 prefetch at tick end — next tick&#x27;s samp0 address is computable then ((hiaddr&lt;&lt;20)|ram1[slot][4]; hiaddr = ram2[7] bits [11:8], untouched by the key update which only touches bits 15:12 and 5). Implement via a SHARED address-translation helper (not a duplicated switch); estimated cost ~5–8 insns/slot-tick; ~30-line change + prefix verify. Bit-exactness unaffected by construction (prfm never faults, never changes results). NOT in the variant kernel (prefetch excluded from variants by design).</p>
+<p>Source: research file (App. 3, mapping §5), round-2 report §3, round-2 NOTES.md (C section).</p>
+</article>
+<article class="card"><h3>B9 — Runtime dispatch / per-CPU micro-kernels — NOT APPLICABLE</h3>
+
+<p><strong>What it is.</strong> dav1d detects NEON/DotProd/I8MM/SVE via getauxval(AT_HWCAP) and dispatches to hand-written GAS assembly with size-specific kernels; FFmpeg does the same via av_get_cpu_flags; OpenBLAS uses per-CPU micro-kernels (with optimized CGEMM/ZGEMM kernels specifically for Cortex-A53/A55).</p>
+<p><strong>Relevance.</strong> NONE for our target. We tune for exactly one core (A53 @ 1 GHz in the Pi Zero 2 W) — there is nothing to dispatch between, and A510/out-of-order costs are irrelevant to us. This is the meta-clue in reverse: FFmpeg balances across cores and accepts per-core regressions; we get to be more single-minded than FFmpeg.</p>
+<p><strong>Tried.</strong> Nothing — correctly nothing.</p>
+<p><strong>Outcome.</strong> NOT APPLICABLE. Recorded here so the catalog is complete and the idea is not re-proposed.</p>
+<p>Source: research file (App. 3, FFmpeg working method + mapping §6).</p>
+</article>
+<article class="card"><h3>B10 — Don&#x27;t copy x86 control flow — NOT APPLICABLE</h3>
+
+<p><strong>What it is.</strong> x86 addressing idioms (e.g. indexing from the end of a range) differ from ARM64&#x27;s. FFmpeg advice: &quot;to learn idiomatic NEON, read small NEON functions in FFmpeg.&quot;</p>
+<p><strong>Relevance.</strong> NONE as a change: our code is native AArch64 C plus hand-written AArch64 asm, not ported x86 flow. Recorded as a warning only — if a future candidate ports an x86-shaped loop, re-check its addressing idioms.</p>
+<p><strong>Tried.</strong> Nothing.</p>
+<p><strong>Outcome.</strong> NOT APPLICABLE.</p>
+<p>Source: research file (App. 3, doctrines).</p>
+</article>
+<article class="card"><h3>B11 — SVE — NOT APPLICABLE</h3>
+
+<p><strong>What it is.</strong> ARM&#x27;s Scalable Vector Extension (variable-length vectors). Until very recently SVE2 was 128-bit-only; variable length gives up unrolling.</p>
+<p><strong>Relevance.</strong> NONE: A53 has no SVE. NEON is the only vector path. Moot for this core, confirmed by the research.</p>
+<p><strong>Tried.</strong> Nothing.</p>
+<p><strong>Outcome.</strong> NOT APPLICABLE.</p>
+<p>Source: research file (App. 3, doctrines).</p>
+</article>
+<hr>
+<h2>Part C — Our-loop candidates (built and measured in the QEMU harness)</h2>
+<p>Harness: <code>~/workspace/tools/qemu-user-build/qemu-aarch64</code> (8.2.2); plugin output to QEMU log (<code>-d plugin -D &lt;file&gt;</code>). All insn deltas vs round-1 <code>cand-base</code> (pristine), prefix 40,831,173,616 insns / 55.451 s host wall. Host wall is TCG-distorted and is never a grade for scheduling; for count-changing candidates it is a second signal only. QEMU insn deltas OVERSTATE NEON wall-time gains (a 128-bit NEON op counts as 1 insn regardless of A53 latency/AGU/dual-issue) — and here, understate the regression, since NEON ops cost 2–3 cycles and volatile-asm barriers block dual-issue scheduling.</p>
+<article class="card"><h3>C1 — NEON intrinsics — TRIED, NOT A ROUTE</h3>
+
+<p><strong>What it is.</strong> Volume pairs + pan/rc quad written with NEON intrinsics, both widths.</p>
+<p><strong>Relevance.</strong> Was the natural first NEON attempt; would have been the maintainable route if the toolchain cooperated.</p>
+<p><strong>Tried.</strong> Round 1: intrinsics implementation, both widths (<code>opt-20261031/NOTES.md</code> § &quot;NEON: intrinsics scalarized&quot;).</p>
+<p><strong>Outcome.</strong> Bit-exact GREEN (0 failures both) BUT VACUOUS — GCC 11.3.1 at <code>-Ofast -mcpu=cortex-a53</code> scalarizes the intrinsics outright (verified in isolation: 0 vector insns; standalone helper also 0). Intrinsics binaries kept (neon64 <code>64ac1f67…</code>, neon128 <code>29553d85…</code>) but superseded by the asm builds. Future NEON work needs asm (or different flags — the flags alternative was named but never pursued; see Unmapped).</p>
+<p>Source: round-1 report §2, round-1 NOTES.md.</p>
+</article>
+<article class="card"><h3>C2 — NEON mix-tail v1, 64-bit asm — TRIED, REJECTED (cost)</h3>
+
+<p><strong>What it is.</strong> Vectorize the per-slot <code>multi()</code> bundles of the mix tail ONLY — volume pairs (multiv1/2 from <code>sample</code>, multiv3/4 from <code>sample2</code>) and the pan/reverb quad (sampl/sampr/rc0/rc1 from <code>sample3</code>) — with hand-written volatile asm, 64-bit vectors (4× <code>mul v0.2s</code>: vol ×2 + pan ×2). Fetch/envelope head stays scalar (A3). Serial accumulation untouched and in order. <code>multi(a,b) = sx20(a) * b</code> with int32 wrap maps exactly to SHL/SSHR #12 + MUL low 32 bits.</p>
+<p><strong>Relevance.</strong> The direct test of &quot;is the mix tail NEON-shaped?&quot; at the width A6 says sometimes schedules better.</p>
+<p><strong>Tried.</strong> Round 1, <code>opt-20261031/cand-neon64/tree/src/backend/pcm.cpp</code> (width selected by <code>-DNEON_MIX_TAIL_WIDTH</code>). Vector code confirmed present in the binary (not just the source — the C1 lesson).</p>
+<p><strong>Outcome.</strong> Bit-exact GREEN on prefix (0 failures) but a regression: 41,518,178,621 insns (+1.68%), PCM_Update 18,328,871,411 (+3.89%), host wall 57.623 s (+3.9%). Why: +27 insns/slot-tick — pack/unpack overhead (dup + ins×2/4 + umov×2/4 + shl + sshr ≈ 8–12 asm insns per bundle) exceeds the 2–4 scalar multis replaced, AND volatile asm is a scheduling barrier (forces multiv values through stack slots instead of registers, blocks dual-issue scheduling across blocks). REJECTED as a performance direction. Full-song runs not done (round-1 precedent: a candidate rejected on prefix does not need a full run). Hardware verdict for the NEON direction as a whole now rides on C4 as variant 3.</p>
+<p>Source: round-1 report §2, round-1 NOTES.md.</p>
+</article>
+<article class="card"><h3>C3 — NEON mix-tail v1, 128-bit asm — TRIED, REJECTED (cost, width-neutral)</h3>
+
+<p><strong>What it is.</strong> Same call sites and bundles as C2, 128-bit vectors (3× <code>mul v0.4s</code>: vol ×2 + pan ×1).</p>
+<p><strong>Relevance.</strong> The A6 width question, tested directly against C2.</p>
+<p><strong>Tried.</strong> Round 1, <code>opt-20261031/cand-neon128/tree/src/backend/pcm.cpp</code>.</p>
+<p><strong>Outcome.</strong> Bit-exact GREEN on prefix (0 failures), 41,518,178,610 insns (+1.68%) — differing from C2 by 11 insns total; PCM_Update identical 18,328,871,411. Host wall 54.390 s (−1.9%) is TCG distortion, NOT evidence (it proves the distortion: insns up, wall down). Width is insn-neutral here — the bottleneck is packing + barriers, not vector width. REJECTED with C2.</p>
+<p>Source: round-1 report §2.</p>
+</article>
+<article class="card"><h3>C4 — NEON mix-tail v2, full-width loads, zero INS — TRIED, DEPRIORITIZED (not disproven)</h3>
+
+<p><strong>What it is.</strong> Single asm block per slot-tick for the whole mix-tail multi chain, zero INS. Coefficient vectors built by scalar C code into a 16-byte-aligned stack array (<code>neon_pack[4]</code>, pairs packed as <code>cA | cB&lt;&lt;32</code> etc.) and loaded with full-width <code>ldr q1</code>/<code>ldr q2</code> (vol pair in q1 low/high halves, pan/rc pair in q2); multiplicands DUP&#x27;d full-width (<code>.4s</code>); serial addclip20 chain including the cin rounding bit runs as scalar instructions inside the block (sx20(x&gt;&gt;k) via SBFX: <code>sbfx #6,#20</code> for sx20(m&gt;&gt;6), <code>sbfx #13,#19</code> for sx20(m&gt;&gt;13) — the latter disassembles as the <code>asr</code> alias, which is correct, not a bug); only sampl/sampr/rc0raw/rc1raw leave via UMOV (unavoidable scalar interface to the serial sum chain, which stays in order). Single-accumulator (B1), per the round-2 brief.</p>
+<p><strong>Relevance.</strong> The B4 remedy applied: full-width loads instead of lane inserts, plus the v1 barrier lesson kept in view. The question it answers is whether the pack cost was an artifact of the INS construction or structural to the loop.</p>
+<p><strong>Tried.</strong> Round 2, <code>opt-round2-20261031/cand-neon2/tree/src/backend/pcm.cpp</code> (mix region, <code>#if defined(NEON_MIX_TAIL_V2)</code>). Binary md5 <code>4a5fa16ca8fe3c13e778b4d384e420d6</code>; PCM_Update 0x2584 → 0x2640; new code confirmed in disassembly (<code>ldr q1</code>/<code>ldr q2</code>, <code>dup v0.4s</code>, w17/w18 sample2/sample3 adds).</p>
+<p><strong>Outcome.</strong> Bit-exact GREEN on prefix (54,999,240 steps, 54 checkpoints, 0 failures); full E1M1 not run (rejected-on-prefix precedent). Numbers: 41,764,790,169 insns vs baseline 40,831,173,616 = +933,616,553 (+2.29%); PCM_Update +933,616,539 (+5.29%); ≈ +36.8 insns/slot-tick; host wall 57.619 s (+3.9%). WORSE than v1 (+1.68%). Why (from disassembly): pack construction ≈ 20 insns (extracts + ubfiz/orr + stp/str + address computation + 2× ldr q); the block itself is 38 insns vs ≈ 37 for the scalar region it replaces (roughly a wash); plus <code>memory</code>-clobber spill/reload traffic around the block. Lesson: INS was the cheaper construction (8 insns for all coefficient vectors vs ~20 for pack+load). The FFmpeg full-width-load trick pays only when data is ALREADY in memory — for computed scalars, building a memory vector to load it back is strictly more work than inserting lanes. Status correction (2026-10-31, the challenge noted): the round-2 report said &quot;CLOSED&quot;/&quot;DEAD&quot; and &quot;do NOT build a NEON hardware kernel from either&quot; — that overstated the evidence, since the rejection rested on net insn increase + packing mechanism, NOT correctness (both shapes bit-exact green), and hardware remains the verdict. Corrected status: DEPRIORITIZED, not disproven. Hardware verdict: variant 3 (&quot;neon2&quot;) in the auto-sequence variant kernel — if its cycle totals and real-time rate beat baseline, the rejection is overturned by measurement.</p>
+<p>Source: round-2 report §1, MEMORY.md (correction 2026-10-31).</p>
+</article>
+<article class="card"><h3>C5 — Split-accumulator NEON — IN PROGRESS (round 3, variant 4/5)</h3>
+
+<p><strong>What it is.</strong> The NEON mix tail with the serial accumulation split across two (or more) independent accumulators, combined at the end — the B2 shape applied to the NEON tail, as opposed to C4&#x27;s single accumulator (B1).</p>
+<p><strong>Relevance.</strong> Directly tests B1 vs B2 on hardware: does the A53 forwarding path (same-register wins) or the chain-breaking instinct (split wins) govern OUR mix accumulators? The research is explicit that whether the FIR finding extends to NEON fadd mix accumulators is UNMEASURED.</p>
+<p><strong>Tried.</strong> NOT attempted in rounds 1–2 (round 2 preserved the serial sum by design). Authorized 2026-10-31 ~09:39 as a round-3 variant.</p>
+<p><strong>Outcome.</strong> PENDING harness bit-exact gate — full E1M1 green required for inclusion in the variant kernel (variants 4/5). RISK, stated plainly: reordering intermediate sums through sx20 is not bit-exact in general (an intermediate sum exceeding 20 bits wraps when re-read through sx20) — the gate is the only thing that can save it, and a split form must pass the gate first. If it fails the gate, it is FAILED, not tuned.</p>
+<p>Source: round-2 report §1 (split-accumulator note), MEMORY.md (round-3 authorization 2026-10-31).</p>
+</article>
+<article class="card"><h3>C6 — Restructured-layout NEON — IN PROGRESS (round 3, variant 4/5)</h3>
+
+<p><strong>What it is.</strong> Restructure the mix so vectors do not need per-tick packing at all — keeping voice coefficients in vector form across ticks, or processing voices in vector lanes, instead of packing scattered scalars into a vector on every slot-tick and unpacking results after.</p>
+<p><strong>Relevance.</strong> This is the only direction that removes the packing cost rather than relocating it: C2 packed in registers (INS, 8 insns), C4 packed in memory (pack+load, ~20 insns) — both lost because the loop&#x27;s inputs are scattered scalars. A layout change attacks the cause (data layout), not the construction method. It is algorithmic surgery on the mix, not an asm tweak, and it is bigger than any round-1/2 change.</p>
+<p><strong>Tried.</strong> NOT attempted in rounds 1–2. Authorized 2026-10-31 ~09:39 as a round-3 variant.</p>
+<p><strong>Outcome.</strong> PENDING harness bit-exact gate — full E1M1 green required for inclusion in the variant kernel (variants 4/5). No numbers exist yet; no gain is claimed.</p>
+<p>Source: MEMORY.md (round-3 authorization 2026-10-31); parent analysis 2026-10-31 ~09:35 (packing-cost diagnosis).</p>
+</article>
+<article class="card"><h3>C7 — Lambda-pair scheduling (sched) — TRIED, QUEUED for HW A/B (variant 1)</h3>
+
+<p><strong>What it is.</strong> The slot loop body (~465 lines, <code>pcm.cpp</code> slot loop) executed as an <code>always_inline</code> lambda called twice per pair iteration (<code>process_slot(s)</code>, <code>process_slot(s+1)</code>, odd remainder handled), so the compiler can schedule the second slot&#x27;s independent head (ROM fetch, envelope) across the first slot&#x27;s serial mix tail. Execution ORDER is identical (s, s+1, …), so all shared-state updates (ram1[31] mix bus, rcsum, slot2 cross-writes) keep their original sequence. No <code>return</code>/<code>goto</code> in the body; all <code>break</code>s are inside switches.</p>
+<p><strong>Relevance.</strong> The scalar-scheduling candidate the A1 fact predicts: create dual-issue pairs without changing order or semantics.</p>
+<p><strong>Tried.</strong> Round 1, <code>opt-20261031/cand-sched/tree/src/backend/pcm.cpp</code>. Dead end first: <code>#pragma GCC unroll 2</code> has NO effect (PCM_Update byte-identical, 0x2584) even with <code>--param max-unrolled-insns=3000</code> and <code>-funroll-loops</code> — the lambda-pair restructure was the replacement that actually changes codegen (PCM_Update 0x2584 → 0x37b4 (+0x1230), no <code>process_slot</code> symbol, fully inlined).</p>
+<p><strong>Outcome.</strong> Bit-exact GREEN on prefix AND full E1M1 (164,997,213 steps, 164 checkpoints, 0 failures) AND full BELMO (441,939,679 steps, 441 checkpoints, 0 failures) — full engine-semantics success. Grade (ordered-trace + A53 cycle model ONLY, never insn delta or host wall for scheduling): baseline window 5,000,000 insns → 4,286,700 cycles, CPI 0.8573; sched window → 4,290,718 cycles, CPI 0.8581; delta +4,018 cycles (+0.09%) — no gain, within model noise. Why no gain (reasoned argument): GCC&#x27;s scheduler reorders WITHIN basic blocks, and the slot body is fragmented by switches (DPCM, filter, MK1/JV880 paths) and branches into many small basic blocks — the pair structure does not create larger scheduling regions; the accumulator chain serializes slot tails regardless; the stalls the model does see (~38% of cycles) are load-use chains with limited independent work in the same basic block to fill the latency. QUEUED for hardware A/B (variant 1 in the auto-sequence kernel): shape-kernel pct is the ground truth — the model assumes L1 hits and no icache effects, and a real hardware run could differ (including adversely, if the larger code hurts icache). Do not present +0.09% as a Pi percentage; it is a ranking-grade estimate that says &quot;no modeled gain.&quot; Still the best scheduling candidate (outranks C8 on model and code growth).</p>
+<p>Source: round-1 report §3, round-1 NOTES.md (sched + model tooling sections).</p>
+</article>
+<article class="card"><h3>C8 — Head/tail pair split, hand-interleaved software pipelining (pipe) — TRIED, QUEUED low-priority (variant 2)</h3>
+
+<p><strong>What it is.</strong> See B7 for the full description: head(s), head(s+1), tail(s), tail(s+1) per pair; serial sum kept in order; 7-field PipeCtx.</p>
+<p><strong>Relevance.</strong> The strongest untested candidate class per the research (B7), now tested.</p>
+<p><strong>Tried.</strong> Round 2, <code>opt-round2-20261031/cand-pipe/</code> (fresh copy of round-1 cand-base, NOT built on neon2 — measured against the pristine baseline). Binary md5 <code>42f50ee4e9f89f9d0abb0753875eea9c</code>; PCM_Update 0x4ecff0 size 0x4ab0 (baseline 0x2584 — ~1.9× code growth, icache note A9).</p>
+<p><strong>Outcome.</strong> Bit-exact GREEN on prefix + full E1M1 (164,997,213 steps, 164 checkpoints, 0 failures) — the reorder is bit-exact, as the safety case predicted. Model: 4,294,669 cycles vs baseline 4,286,700 = +7,969 (+0.19%), CPI 0.8589 vs 0.8573 — NO MODELED GAIN, slightly negative, and mechanism-negative (B7). QUEUED for hardware A/B ONLY as a low-priority check (variant 2); the model is ranking-grade and hardware is ground truth, so a hardware run could in principle overturn it — but the mechanism analysis independently predicts no gain, the code grew ~1.9×, and there is nothing for hardware to find that the model + mechanism haven&#x27;t already excluded. If a future HW A/B sweep wants a scheduling candidate, C7 outranks this one.</p>
+<p>Source: round-2 report §2, round-2 NOTES.md (B section).</p>
+</article>
+<article class="card"><h3>C9 — GCC <code>#pragma GCC unroll 2</code> on the slot loop — TRIED, DEAD</h3>
+
+<p><strong>What it is.</strong> Asking the compiler to unroll the slot loop by 2 (the cheap route to the C7 pair structure).</p>
+<p><strong>Relevance.</strong> Would have given C7&#x27;s shape for free if the compiler cooperated.</p>
+<p><strong>Tried.</strong> Round 1, on the ~465-line slot loop body.</p>
+<p><strong>Outcome.</strong> NO effect: PCM_Update object byte-identical to pristine (0x2584), even with <code>--param max-unrolled-insns=3000</code> and <code>-funroll-loops</code> (with <code>-funroll-loops</code> only a small inner loop grew, 0x2584 → 0x268c, not the slot loop). DEAD — the lambda-pair restructure (C7) was the replacement.</p>
+<p>Source: round-1 report §3, round-1 NOTES.md.</p>
+</article>
+<article class="card"><h3>C10 — TIMER_Clock closed form — TRIED, FAILED (correctness) + caps ~1%</h3>
+
+<p><strong>What it is.</strong> Event-driven skip inside <code>TIMER_Clock</code> (<code>mcu_timer.cpp</code>, function only). A tick that is neither a compare-match nor a counter wrap only increments the counter, so a run of event-free ticks is skipped arithmetically and only the event tick runs the original <code>ClockFrt</code>/<code>ClockTmr</code> body (flag, CCLRA-clear, overflow, interrupt, deadline semantics identical by construction; wrap excluded since rem ≤ d_wrap keeps the counter ≤ 0xffff/0xff). Original bodies untouched; ONLY <code>mcu_timer.cpp</code> differs from the backup tree.</p>
+<p><strong>Relevance.</strong> TIMER_Clock is 18.90% of baseline insns (step-4 attribution) — the largest single MCU-side block, and the step-4 assumption was a −50% cut worth −9.5% total. If core 2&#x27;s gap turns out to be MCU work (D7 decision rule), the MCU side is where the fix must live.</p>
+<p><strong>Tried.</strong> Round 1, <code>opt-20261031/cand-timer/tree/src/backend/mcu_timer.cpp</code> (TIMER_Clock + TicksToTarget helper).</p>
+<p><strong>Outcome.</strong> FAILED bit-exactness: prefix 2 failures (checkpoint 0 @ step 1,000,000 + final state); boot 2 failures (checkpoint 22 @ step 575,000 + final state, of 400 checkpoints). Control (pristine tree) verifies 0 failures on boot, so the divergence IS the timer change, not tree drift. HashState covers only r/pc/sr/sram/ram/dev_register (timer internals NOT hashed) and audio matched, so the divergence is a TRANSIENT firmware-execution phase difference — an interrupt taken at a slightly different step (state differs at the checkpoint instant, reconverges by the next checkpoint). The closed form shifts SOME timer event by ≥1 step somewhere before step 575,000; the tick-count/deadline/flag logic was re-proven correct on paper, so the shift mechanism is NOT yet identified. Diagnostic insn result only (a FAILED candidate is not ranked): total −1.04%, TIMER_Clock −4.64% (7,358,746,020 vs 7,717,003,576). Why so small (vs the assumed −50%): rem is almost always 1–3 ticks (target advances 6/call, strides ≥ 4), so the per-call distance math (~120 insns ×3 FRTs + TMR, every one of 55M calls) costs MORE than the 1–3 tick bodies it skips in the common case; the net −4.6% comes only from rarer large-rem windows. Even if the bit-exactness bug were fixed, this shape caps at ~1% total — TIMER_Clock is NOT the easy 9.5% win. A future timer attempt would need near-zero per-call overhead (e.g. a cheaper event test) or a different structure, and must first pass the gate via the checkpoint-dump debug path (dump all timer fields at every checkpoint on boot for baseline + timer, diff, localize the first differing checkpoint, then step-window dump around it). DEAD in current shape; do not revive without fixing bit-exactness AND redesigning for near-zero per-call overhead.</p>
+<p>Source: round-1 report §4, round-1 NOTES.md (timer sections).</p>
+</article>
+<article class="card"><h3>C11 — PCM_ReadROM inlining (item-4) — MEASURED SAFE WIN, not yet in split</h3>
+
+<p><strong>What it is.</strong> Inlining the PCM_ReadROM call (<code>pcm.cpp:33</code>), a real call in the harness tree at 5.91% of baseline insns as its own symbol.</p>
+<p><strong>Relevance.</strong> Small, safe total-work reduction — the kind of win that survives the bit-exact gate by construction (no semantics change, just call overhead removed).</p>
+<p><strong>Tried.</strong> Measured in an earlier round (not round 1 or 2 of 2026-10-31); pushed to branch <code>feature/nuked-sc55-optimization</code> as <code>f8a0a2e</code>.</p>
+<p><strong>Outcome.</strong> −0.76% measured. NOT in the harness tree or in main; NOT re-measured in rounds 1–2. It remains the only previously measured safe win not yet in the split — pending integration, small, and deliberately not bundled with other work (commit discipline: only what was approved, separately).</p>
+<p>Source: round-1 report §7 (footnote), round-1 NOTES.md (code findings).</p>
+</article>
+<hr>
+<h2>Part D — Methodology (how every number above was earned, and what it cannot show)</h2>
+<article class="card"><h3>D1 — Measure-or-don&#x27;t-submit (checkasm discipline) — ADOPTED</h3>
+
+<p><strong>What it is.</strong> FFmpeg&#x27;s rule, from Martin Storsjö&#x27;s VDD26 talk and commit history: &quot;Before submitting a patch, measure it. If it is not faster than the existing C implementation, adding assembly has no value.&quot; Every ARM asm patch carries before/after checkasm numbers across cores, A53 included (2017 vp9 loop filters 2–6× on A53; 2019 vp8 put_epel16_h6v6: A53 2183.0 → 1729.4, ~21% — in cntvct TICKS, see D2 units correction).</p>
+<p><strong>Relevance.</strong> This is our discipline too, in our own shape: the harness&#x27;s verify + measure pairing (bit-exact gate + insn/model grade) and the variant-kernel hardware A/B (pct + cycle counts) are the same rule. &quot;Code with broken dependency chains runs faster than code that looks tidy&quot; and &quot;in simple functions, unrolling the loop is needed to give the CPU more independent data&quot; are the scheduling doctrines behind C7/C8.</p>
+<p><strong>Tried.</strong> Adopted as the grading rule for rounds 1–2 (never present insn deltas or host wall as a scheduling measurement; never present a model estimate as a Pi percentage).</p>
+<p><strong>Outcome.</strong> No candidate has yet passed it on hardware — that is the point of the variant kernel.</p>
+<p>Source: research file (App. 3, doctrines + FFmpeg working method).</p>
+</article>
+<article class="card"><h3>D2 — PMU cycle tooling in the variant kernel — BEING BUILT</h3>
+
+<p><strong>What it is.</strong> FFmpeg&#x27;s new ext perf layer (dav1d-derived rewrite, <code>tests/checkasm/ext/</code>, 2025, Niklas Haas) reads TRUE CPU cycles via direct <code>pmccntr_el0</code> (isb + mrs), enabled via checkasm_pmccntr_enable (PMCR.E=1, PMCNTENSET bit 31, PMCCFILTR bits 30/28 cleared) run on ALL cores, validated (must increment within 20 µs or it errors, never silently reports zeros). Bench methodology worth copying: adaptive iteration count toward a time budget but ALWAYS ≥30 samples even past budget; ASM loop shape with 32-call batches and inline outlier rejection (a batch is kept only if t×count ≤ sum×4, i.e. batches &gt;4× the running trimmed mean are dropped — kills interrupt/SIMD-warmup outliers); NOP calibration (measures an empty call and SUBTRACTS it from every result); log-mean + log-variance statistics (mode ± stddev, C-vs-asm ratio, perf_scale to nanoseconds); CPU affinity flag pins to one core; correctness + bench unified (without --bench each function is called once with bit-exact validation; with --bench the same inputs are timed).</p>
+<p><strong>Relevance.</strong> Ported to our bare-metal kernel: NO permission problem (privileged kernel; the Linux-userspace PMUSERENR problem does not exist). PMU registers are PER CORE, so core 2 enables/reads its own counter and core 3 its own. Boot-time validation: if a counter does not increment, log an error, never report zeros. NOP calibration: measure the empty timed region once at boot, subtract from per-region numbers (matters for short regions like a single tick).</p>
+<p><strong>Tried.</strong> Surveyed 2026-10-31 (FFmpeg master cloned to <code>/tmp/ffmpeg</code> — ephemeral, not a durable source). Port NOT built at survey time; authorized by 2026-10-31 ~09:21 (&quot;Build the PMU cycle tooling into the variant kernel&quot;).</p>
+<p><strong>Outcome.</strong> BEING BUILT into the variant kernel (tree <code>~/workspace/mt32-pi-shaped-var/</code>, base = shaped-diag tree): win fields <code>pcm_cyc</code> (core-3 PCM task work) + <code>mix_cyc</code> (voice-mix portion, accumulated per batch, not per tick, to keep read overhead negligible) + <code>step_cyc</code> (core-2 stepping only) + <code>lock_cyc</code> (core-2 lock spins only), alongside the existing µs fields; boot line carries <code>pmc2=ok|fail pmc3=ok|fail</code>; NOP-calibrated; auto-sequence variants 0 baseline / 1 sched / 2 pipe / 3 neon2 → stop (no hardware keys; audio silence + <code>sequence_done</code> log line are the done signals; LED heartbeat unchanged). NOT the diag kernel (do not churn the pending gating run); NOT the harness (QEMU cannot read PMU meaningfully). Units correction carried forward: the CLASSIC checkasm timer reads <code>cntvct_el0</code> (typically 62.5 MHz) — the old A53 commit-message numbers are in TICKS, not CPU cycles; ratios/speedups are unaffected, absolute &quot;cycles&quot; claims from those numbers would be wrong.</p>
+<p>Source: research file (App. 4), MEMORY.md (variant-kernel build 2026-10-31).</p>
+</article>
+<article class="card"><h3>D3 — PMU phase-2 event counters — PROPOSED, not built</h3>
+
+<p><strong>What it is.</strong> PMU event counters (PMXEVCNTR) — instructions retired + L1D refill + branch mispredict — giving IPC and stall attribution alongside cycle counts.</p>
+<p><strong>Relevance.</strong> Cycles + instructions distinguishes &quot;more work&quot; from &quot;more stalls&quot; — which is exactly the core-2 39-point question (lock spins vs MCU-insn premium vs core-2 extras), and the same distinction for every engine candidate.</p>
+<p><strong>Tried.</strong> Nothing.</p>
+<p><strong>Outcome.</strong> PROPOSED (small, phase 2 of the PMU port), NOT BUILT. No numbers exist.</p>
+<p>Source: research file (App. 4, port proposal).</p>
+</article>
+<article class="card"><h3>D4 — QEMU insn-count limits — ESTABLISHED</h3>
+
+<p><strong>What it is.</strong> QEMU counts TCG instructions. A 128-bit NEON op counts as 1 insn regardless of its A53 latency, AGU occupancy, or dual-issue behavior. TCG has no cache model. Host wall time is distorted by x86 out-of-order execution, which hides exactly the stalls that matter on the in-order A53.</p>
+<p><strong>Relevance.</strong> QEMU ranks scalar-scheduling variants ONLY via ordered trace + cycle model (D5&#x27;s tooling); it CANNOT adjudicate NEON-vs-scalar (NEON insn deltas OVERSTATE wall-time gains); it CANNOT measure cache effects (all of B8&#x27;s gain hypothesis, any L1/L2 behavior, icache effects A9); it CANNOT answer the core-2 binding question. QEMU is correctness-only for NEON (the verify gate) — and checkasm&#x27;s own practice agrees (QEMU is correctness-only; checkasm without --bench).</p>
+<p><strong>Tried.</strong> Established across step 4 and rounds 1–2 (neon128&#x27;s insns-up/wall-down case is the standing proof of TCG distortion).</p>
+<p><strong>Outcome.</strong> ESTABLISHED as the grading rule: count-changing candidates get insn delta + host wall as approximate signals with caveats; scheduling candidates get trace + model only; hardware A/B is ground truth for all.</p>
+<p>Source: round-1 report §1, round-2 report (&quot;What the harness cannot measure&quot;), research file (App. 4, dev setup).</p>
+</article>
+<article class="card"><h3>D5 — llvm-mca A53 limits — ESTABLISHED (localized, not global)</h3>
+
+<p><strong>What it is.</strong> LLVM&#x27;s AArch64SchedA53.td (origin Feb 2014, D2829, no NEON at first; last substantive timing fix Oct 2023, David Green postinc operand order; 2024–2026 touches mechanical only — FEAT_FPv2, C1-Nano, Ampere1B bookkeeping, typo fixes; NO systematic re-measurement). What is RIGHT in current main: in-order (MicroOpBufferSize=0), IssueWidth=2, single LdSt resource (matches the single AGU), 2 ALU units, MispredictPenalty=9 (matches measured ~7–10), latencies sourced from ARM&#x27;s own A53 timing spreadsheet (cited in the .td), multi-register vector load/store issue cycles modeled explicitly (VLD1–5: latency 4–8, release 2–5). What is WRONG or MISSING: single FPALU resource (does not model the two 64-bit NEON halves dual-issuing); plain 128-bit load occupancy not modeled as 2-cycle (Estevez&#x27;s <code>ldr q0</code> complaint); forwarding assumed (the .td comment itself admits &quot;These latencies will be incorrect when the result cannot be forwarded&quot;); LoadLatency=3 optimistic (assumes L1 hit + bypass). Tool-scope limits (not model bugs): llvm-mca analyzes a straight-line block in isolation — per its own man page it does not model branch prediction or fetch/decode, and it never models caches or memory addresses.</p>
+<p><strong>Relevance.</strong> A challenge to the blanket &quot;LLVM&#x27;s A53 model is wrong&quot; (LLVM is not static; &quot;wrong&quot; is not binary). The revised guidance supersedes the blanket ban: llvm-mca&#x27;s A53 numbers are usable as a rough pipeline sanity check for straight-line scalar code, but NOT trustworthy for NEON dual-issue, vector-load throughput, or anything involving memory or branches — and never as the grading tool for scheduling (own cycle model from microbenchmarks, or hardware A/B, remains the way).</p>
+<p><strong>Tried.</strong> Empirically retested 2026-10-31 (<code>llvm-mca-a53-retest-20261031.md</code>, LLVM 23.1.4, Oct 2026): all three Feb 2025 complaints STILL reproduce — <code>ldr q0</code> 1.0–1.04 cycles/load (reality 2.0); fadd+add retire-together (add D@3, both E@6; 3.04 cycles/pair steady-state); 64-bit fadd+ldr no dual-issue (2.05 cycles/pair). Scalar control PASSES (independent adds dual-issue, IPC 1.89; order-swapped add-first dual-issues; dependent-add forwarding works). So the wrongness is LOCALIZED to NEON-follower scheduling, not global — scalar parts fine, NEON complaints unchanged ~20 months later.</p>
+<p><strong>Outcome.</strong> ESTABLISHED: our scheduling grades use the hand-built <code>a53sim.py</code> (ordered trace + microbenchmark timings), never llvm-mca.</p>
+<p>Source: research file (App. 1, LLVM appendix), <code>hidden_files/llvm-mca-a53-retest-20261031.md</code>.</p>
+</article>
+<article class="card"><h3>D6 — Bit-exact gate discipline — ABSOLUTE</h3>
+
+<p><strong>What it is.</strong> Every candidate must reproduce the decoder2-oracle goldens exactly (state hash excludes <code>pcm_t</code>; <code>grep &#x27;verify:&#x27;</code> for the verdict, never tail output — verify exit status is masked when piped through <code>tail</code>). A failing candidate is FAILED with its checkpoint, never tuned to fit goldens. Prefix is for iteration only; full E1M1 (+ BELMO where in scope) is required before claiming engine-semantics success.</p>
+<p><strong>Relevance.</strong> This is why C10 is dead despite a favorable diagnostic number, why C5/C6 must pass the gate before reaching the variant kernel, and why B3 (tree reduction) is blocked rather than merely unmeasured.</p>
+<p><strong>Tried.</strong> Applied to every candidate in rounds 1–2 (C7/C8 full-song green; C2–C4 prefix green; C10 failed with checkpoints named).</p>
+<p><strong>Outcome.</strong> ESTABLISHED, non-negotiable. MIDI/golden paths kept short (ReadGolden truncates at 63 chars) — a harness trap, not a gate rule, but recorded here because it has bitten runs before.</p>
+<p>Source: round-1 report §1, round-2 report (Scope and gates).</p>
+</article>
+<article class="card"><h3>D7 — Diag-kernel gating measurement — AWAITING RUN</h3>
+
+<p><strong>What it is.</strong> The shaped-diag kernel (<code>~/workspace/kernel8-debug-shaped-diag-20261031.img</code>, 582,225 B, md5 <code>1f12844ef17e35d25434840deedcf46c</code>, <code>_end</code> 0x2ef56c, tree <code>~/workspace/mt32-pi-shaped-diag/</code>, log <code>SD:/shaped-diag-stats.log</code>, marker <code>kernel=mt32-shaped-diag</code>) splits core-2 <code>StepUntilFill</code> time into MCU stepping vs state-lock spin waits: <code>ThreadSplitStateCircle</code> gains <code>lock_wait_us</code> + <code>lock_waits</code> (core-2-only, written in <code>SkelPCMWrite</code> committing branch + <code>SkelPCMRead</code> status branch around <code>Acquire</code>, timed with <code>CTimer::GetClockTicks()</code>; uncontended acquires read 0 µs, so <code>lock_us</code> counts contended waits and <code>lock_waits</code> counts every lock op; core-3 batch holds NOT counted — they are what core 2 waits ON). Win line gains <code>lock_us</code> + <code>lock_waits</code> + <code>mcu_us</code> (step-loop wall MINUS <code>lock_us</code>).</p>
+<p><strong>Relevance.</strong> THE gating measurement for all optimization claims: the ~39-point core-2 gap decides whether engine speed work matters at all.</p>
+<p><strong>Tried.</strong> Built and parent-verified (all guards pass); diagnostic-only (two extra timer reads per lock op on the hot path — never ship it).</p>
+<p><strong>Outcome.</strong> AWAITING HARDWARE RUN (E1M1 only; auto-starts, no key presses needed). Decision rule: if <code>lock_us</code> is a large fraction of the step-loop wall → the gap is LOCK SPINS (fix sync design: finer lock granularity, shorter batches, lock-free publication — NOT engine speed; do not pursue NEON voices as the fix). If <code>lock_us</code> ≈ 0 (<code>mcu_us</code> ≈ step wall) → the gap is MCU WORK (H8 decoder2 dispatch costs more per instruction on A53 than QEMU insn counts suggest, and/or core-2 extras) — NEON voices becomes credible again as one lever, and C7&#x27;s hardware A/B is worth running. Either way, report sustained pct + devq_low + sound_drops as before (the chop metric); the new fields explain the pct, they don&#x27;t replace it.</p>
+<p>Source: round-1 report §5, MEMORY.md (diag kernel entry).</p>
+</article>
+<hr>
+<h2>Part E — Does not transfer</h2>
+<article class="card"><h3>E1 — FFmpeg video block / streaming shapes — DO NOT TRANSFER</h3>
+
+<p><strong>What it is.</strong> FFmpeg&#x27;s kernels are mostly pure-NEON streaming throughput loops over large blocks; dav1d&#x27;s are block-oriented pixel functions.</p>
+<p><strong>Relevance.</strong> NONE to our loop shape: our voice loop is short, branchy, per-voice stateful (envelope, phase), with a 128-tick batch bound and a state lock. FFmpeg&#x27;s unroll-and-interleave doctrine transfers; its block sizes and streaming shapes do not. Ours also mixes a scalar fetch/envelope head (no gather — stays scalar) with a vector mix tail, where FFmpeg&#x27;s kernels are mostly pure NEON streaming — the FFmpeg playbook agrees with the split (do not vectorize the gather part).</p>
+<p><strong>Tried.</strong> Nothing — correctly nothing.</p>
+<p><strong>Outcome.</strong> DO NOT TRANSFER. Recorded so a future reader does not import block-loop unroll factors or streaming shapes into this loop.</p>
+<p>Source: research file (App. 3, &quot;What does NOT transfer&quot;).</p>
+</article>
+<article class="card"><h3>E2 — dav1d/FIR headline numbers (3×, 3.37×, 40%) as predictions — DO NOT TRANSFER</h3>
+
+<p><strong>What it is.</strong> The 3× partial-load fix, the 3.37× combined figure, and the ~40% same-register accumulation gain are dav1d/FIR numbers on their own loops and cores.</p>
+<p><strong>Relevance.</strong> They set priors and candidate shapes, NOT expected gains for our loop. The 3× core attribution is not even pinned to A53 specifically in the talk report. Quoting any of them as a predicted gain for the Nuked voice loop would be inventing a roadmap — the standing rule (a feature/number either exists with a source, does not exist, or is Not Verified) forbids it.</p>
+<p><strong>Tried.</strong> The shapes behind the numbers were tried (B4, B1/C5); the numbers themselves were never claimed for our loop.</p>
+<p><strong>Outcome.</strong> DO NOT TRANSFER as predictions. Our loop&#x27;s numbers are only the ones measured in Parts C–D.</p>
+<p>Source: research file (App. 3, &quot;What does NOT transfer&quot; + trick caveats).</p>
+</article>
+<hr>
+<h2>Research items with NO tried/queued outcome (unmapped — stated plainly)</h2>
+<p>These surfaced in the research but have no candidate, measurement, or queued implementation. They are NOT hidden inside a verdict above.</p>
+<ol>
+<li><strong>Pi-specific cache configuration (BCM2710A1 L1/L2 sizes, replacement policy).</strong> SoC cache sizes are implementation choices — phone-SoC numbers (ARMageddon 2016: Snapdragon 410, L1 32 KB 4-way, L2 512 KB 16-way, instr-inclusive / data-non-inclusive) do NOT transfer exactly to BCM2710A1. No Pi source was found. NOT MEASURED. Consequence: A7&#x27;s latency numbers are folklore-grade for our SoC, and B8&#x27;s &quot;L1-resident&quot; expectation is an inference, not a measurement.</li>
+<li><strong>A55-guide per-instruction tables as the basis for a cycle model.</strong> The tables exist and are public (ARM-EPM-128372 §4), but our <code>a53sim.py</code> was hand-built from microbenchmark timings, NOT from A55 tables. The tables remain an unused prior — a future model revision could start from them and validate against A53 microbenchmarks. NOT TRIED.</li>
+<li><strong>llvm-exegesis on a Linux-booted Pi.</strong> llvm-exegesis exists for AArch64 but must run ON A53 hardware under Linux with libpfm; no published A53 exegesis tables were found, and it cannot run on the bare-metal Circle kernel. A Linux-booted Pi 3 / Zero 2 W could run it — a separate hardware exercise. NOT DONE.</li>
+<li><strong>Deeper (3–4 voice) interleaving.</strong> Round 2 tested the pair split (B7/C8). A 3–4-deep interleave was NOT attempted. The pair-split mechanism analysis (load→use distances within each head unchanged; ctx traffic grows with depth) predicts the same outcome a fortiori, but that prediction is UNMEASURED — it is analysis, not a result.</li>
+<li><strong>Different compiler flags for NEON intrinsics.</strong> Round-1 notes name &quot;asm (or different flags)&quot; as the alternative after scalarization (C1). The flags route was never pursued once asm worked. NOT TRIED.</li>
+<li><strong>Branch-predictor behavior on our kernel.</strong> A55&#x27;s perceptron predictor vs A53&#x27;s GShare is a known transfer caveat (A8), and branch mispredict is ~7–10 cycles (A7) — but no branch-behavior measurement exists for our kernel&#x27;s switch-heavy slot loop. NOT MEASURED. (The cycle model gives branches no mispredict penalty because the path is identical in both schedules, so branch costs cancel in the delta — that is a modeling choice, not a measurement.)</li>
+<li><strong>PMU phase-2 event counters.</strong> See D3 — proposed, not built. No IPC or stall-attribution numbers exist yet.</li>
+<li><strong>The core-2 39-point gap itself.</strong> Not an optimization — the gating unknown (D7). Until the diag run lands, every engine-speed claim stays provisional, and no item in Parts B–C can be claimed as the real-time fix.</li>
+<li><strong>Prefetch shared-helper implementation.</strong> See B8 — design only. The ~5–8 insns/slot-tick cost is an estimate, not a measurement.</li>
+<li><strong>Split-accumulator + restructured-layout NEON outcomes.</strong> See C5–C6 — round 3 in progress, gate pending. No numbers exist yet; they are listed as IN PROGRESS, not as results.</li>
+</ol>
+<h2>Sources (all under <code>~/workspace/goals/mt32-pi-nuked-sc55-engine/hidden_files/</code> unless noted)</h2>
+<ul>
+<li><code>a53-execution-research-20261031.md</code> — microarchitecture traps, LLVM A53 appendix, A55-guide transfer analysis, FFmpeg/dav1d Appendix 3, checkasm/PMU Appendix 4.</li>
+<li><code>optimization-20261031.md</code> (round 1) — C1–C3, C7, C9–C11, D7 build, grading rules.</li>
+<li><code>optimization-round2-20261031.md</code> (round 2) — C4, C8, B8, B6, &quot;what the harness cannot measure.&quot;</li>
+<li><code>opt-20261031/NOTES.md</code> — round-1 working notes (scalarization, sched pragma dead end, model tooling, timer debug path).</li>
+<li><code>opt-round2-20261031/NOTES.md</code> — round-2 working notes (pipe surgery, prefetch design, post-increment audit).</li>
+<li><code>llvm-mca-a53-retest-20261031.md</code> — LLVM 23.1.4 retest (D5 numbers).</li>
+<li><code>hotblocks-step4-20261031.md</code> — step-4 attribution (baseline numbers).</li>
+<li><code>~/MEMORY.md</code> (mt32-pi Nuked-SC55 section) — standing context: shape runs, diag kernel, variant kernel (0–3 + round-3 4/5), PMU build, corrections (NEON &quot;CLOSED&quot; → DEPRIORITIZED).</li>
+<li>Candidate trees: <code>opt-20261031/cand-{base,sched,timer,neon64,neon128}/</code>, <code>opt-round2-20261031/cand-{neon2,pipe}/</code>.</li>
+</ul></main>
+<footer>Sources are named at the end of the catalog. Model estimates are labelled as such throughout — no model number is presented as a Pi percentage. NEON mix-tail status: deprioritized, not disproven — hardware verdict rides on variant 3 (neon2) in the auto-sequence variant kernel. Split-accumulator and restructured-layout NEON are in progress (round 3), gated on full-E1M1 bit-exactness.</footer>
+<script>
+const q=document.getElementById('q');let filter='all';
+function apply(){const term=q.value.toLowerCase();document.querySelectorAll('.card').forEach(c=>{const t=c.textContent.toLowerCase();let ok=!term||t.includes(term);if(filter!=='all'){ok=ok&&t.includes(filter)}c.style.display=ok?'':'none'});let vis=[...document.querySelectorAll('.card')].filter(c=>c.style.display!=='none').length;document.getElementById('count').textContent=vis+' items shown';}
+q.addEventListener('input',apply);document.querySelectorAll('button.chip').forEach(b=>b.addEventListener('click',()=>{document.querySelectorAll('button.chip').forEach(x=>x.classList.remove('active'));b.classList.add('active');filter=b.dataset.f;apply()}));apply();
+</script></body></html>
