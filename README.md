@@ -24,7 +24,7 @@ design is proven here.
 ## Status (snapshot 2026-10-31, round 3 sync + timer)
 
 Work in progress. This snapshot contains the RUN-table auto-sequence
-(13 runs = PCM variant x sync profile x timer mode, see below), the
+(17 runs = PCM variant x sync profile x timer mode, see below), the
 PMU cycle + event-counter tooling, the lazy-timer self-test and
 shadow-check mode, and the MiSTer display wiring. Hardware
 verification of this exact snapshot is pending. The round-3 sync/timer
@@ -80,6 +80,10 @@ in `src/minimal.cpp` (`g_runs`), the PCM variants in `pcm.cpp`
 | 10 | neon2lz | 3 neon2 | 3 fifo | lazy | " |
 | 11 | splitlz | 4 splitacc | 3 fifo | lazy | " |
 | 12 | layoutlz | 5 layout | 3 fifo | lazy | " |
+| 13 | romfstlz | 6 romfast | 3 fifo | lazy | round 3b: per-slot ROM bank pointers (host-verified bit-exact) |
+| 14 | scalaclz | 7 scalacc | 3 fifo | lazy | round 3b: exact register accumulators, scalar (host-verified bit-exact) |
+| 15 | romacclz | 8 romacc | 3 fifo | lazy | round 3b: romfast + scalacc (host-verified bit-exact) |
+| 16 | layromlz | 9 layoutrom | 3 fifo | lazy | round 3b: layout + romfast (NEON part unchanged; QEMU gate pending) |
 
 After the last run's song end, the kernel stops: silence, idle windows,
 and a `sequence_done` line. **Silence is the done signal.** The LED
@@ -134,6 +138,10 @@ script to point at your files; it writes `src/songs.h`).
 
 ## Docs
 
+- `docs/variant-review-20261031.md` — review of PCM variants 0-5 against
+  their source ideas (correctness incl. a host differential test, whether
+  each can reach its goal, headroom), plus the round-3b variants 6-9 it
+  queued and the host test tool (`tools/hosttest`).
 - `docs/optimization-round3-sync-20261031.md` — THIS round: where
   core 2's cycles go, the sync levers (lock modes, publish interval,
   layout, IRQ0 hand-off) and the lazy timer with their correctness

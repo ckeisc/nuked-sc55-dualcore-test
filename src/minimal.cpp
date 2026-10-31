@@ -386,6 +386,13 @@ static const TRun g_runs[] = {
 	{"neon2lz", 3, 3, TIMER_MODE_LAZY},	// 10: PCM variant neon2, same
 	{"splitlz", 4, 3, TIMER_MODE_LAZY},	// 11: PCM variant splitacc (upstream round 3), same
 	{"layoutlz", 5, 3, TIMER_MODE_LAZY},	// 12: PCM variant layout (upstream round 3), same
+	// Round 3b PCM variants (scalar ones host-verified bit-exact vs variant 0
+	// on random states; layoutrom carries layout's NEON pass and awaits the
+	// QEMU gate like variants 3-5 did):
+	{"romfstlz", 6, 3, TIMER_MODE_LAZY},	// 13: per-slot ROM bank pointers (PCM_ReadROM resolved once per slot)
+	{"scalaclz", 7, 3, TIMER_MODE_LAZY},	// 14: exact register accumulators (scalar chain-break, catalog B2)
+	{"romacclz", 8, 3, TIMER_MODE_LAZY},	// 15: romfast + scalacc
+	{"layromlz", 9, 3, TIMER_MODE_LAZY},	// 16: layout + romfast
 };
 static const int g_runCount = sizeof(g_runs) / sizeof(g_runs[0]);
 
@@ -396,6 +403,15 @@ static inline const TRun& RunDesc(int nRun)
 	return g_runs[nRun];
 }
 static inline int RunPcm(int nRun) { return RunDesc(nRun).pcm; }
+// PCM variant number -> short name (lookup by number: the table may omit
+// the AArch64-only entries on other hosts, so positions are not numbers).
+static const char* PcmVariantName(int nNumber)
+{
+	for (int i = 0; i < g_pcmVariantCount; ++i)
+		if (g_pcmVariants[i].number == nNumber)
+			return g_pcmVariants[i].short_name;
+	return "?";
+}
 static inline int RunSync(int nRun) { return RunDesc(nRun).sync; }
 static inline int RunTimer(int nRun) { return RunDesc(nRun).timer; }
 static const SplitSyncProfile& SyncProfile(int nNumber)
@@ -2007,7 +2023,7 @@ void CMinimalApp::AudioLoop()
 		const SplitSyncProfile& P = SyncProfile(g_runs[i].sync);
 		LogLine("runlist n=%d name=%s pcm=%d pcm_name=%s sync=%d sync_name=%s lock_mode=%u legacy_lock=%u legacy_timing=%u legacy_irq=%u publish_interval=%u ring_check_interval=%u core3_backoff=%u timer=%d",
 		        i, g_runs[i].name, g_runs[i].pcm,
-		        (g_runs[i].pcm >= 0 && g_runs[i].pcm < g_pcmVariantCount) ? g_pcmVariants[g_runs[i].pcm].short_name : "?",
+		        PcmVariantName(g_runs[i].pcm),
 		        P.number, P.short_name, P.lock_mode, P.legacy_lock, P.legacy_timing, P.legacy_irq,
 		        P.publish_interval, P.ring_check_interval, P.core3_backoff, g_runs[i].timer);
 	}
@@ -2349,6 +2365,13 @@ bool CMinimalApp::Initialize()
 	// broken. Both numbers go to the boot line. A FAIL does not stop
 	// the sequence (the runs still measure), but the lazy-timer runs
 	// are then not trustworthy and tchk must be read with that in mind.
+	// Round 3b: exhaustive PCM_RomFetch vs PCM_ReadROM check against the
+	// real wave ROMs (64M fetches, well under a second). Logged, not gating.
+	{
+		const uint64_t nRomMism = PCM_RomFastSelfTest(m_pEmulator->GetPCM());
+		LogLine("romfast_selftest result=%s mismatches=%llu", nRomMism == 0 ? "pass" : "FAIL",
+		        static_cast<unsigned long long>(nRomMism));
+	}
 	m_nTimerSelfTestPlain = TIMER_SelfTest(true, 400000, false);
 	m_nTimerSelfTestInject = TIMER_SelfTest(true, 400000, true);
 	m_bTimerSelfTestPass = (m_nTimerSelfTestPlain == 0 && m_nTimerSelfTestInject > 0);

@@ -199,9 +199,13 @@ rather than round 1's ~120.
 | 10 | neon2lz | 3 neon2 | 3 fifo | lazy | " |
 | 11 | splitlz | 4 splitacc | 3 fifo | lazy | " (upstream round-3 variant) |
 | 12 | layoutlz | 5 layout | 3 fifo | lazy | " (upstream round-3 variant, the model-positive one) |
+| 13 | romfstlz | 6 romfast | 3 fifo | lazy | round 3b (see `docs/variant-review-20261031.md`): per-slot ROM bank pointers |
+| 14 | scalaclz | 7 scalacc | 3 fifo | lazy | round 3b: exact register accumulators (scalar) |
+| 15 | romacclz | 8 romacc | 3 fifo | lazy | round 3b: romfast + scalacc |
+| 16 | layromlz | 9 layoutrom | 3 fifo | lazy | round 3b: layout + romfast (gate pending) |
 
 E1M1 is ~85 s at real time; slower runs take proportionally longer.
-Thirteen runs ≈ 20 minutes. The sequence stops after run 12
+Seventeen runs ≈ 26 minutes. The sequence stops after run 16
 (`sequence_done`); silence is the done signal, as before.
 
 **How this relates to the upstream PCM variants:** the PCM variants are
