@@ -2544,11 +2544,12 @@ diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
 index b8a4e27..bdc360e 100644
 --- a/src/backend/pcm.cpp
 +++ b/src/backend/pcm.cpp
-@@ -21,6 +21,7 @@
+@@ -21,6 +21,8 @@
   *
   */
  #include "pcm.h"
 +#include "split_thread_circle.h"
++#include "nuked_profile.h"
  #include "mcu.h"
  #include "mcu_interrupt.h"
  #include <cstdint>
