@@ -21,7 +21,7 @@
 // What it is NOT: no mt32-pi code, no UI, no physical LCD, no USB,
 // no network, no LCD mirror, no OSD text (the 3-byte status protocol
 // has no text field; the MiSTer's own pop-ups on status change are
-// unchanged). The stats file (shaped-var-stats.log) is the
+// unchanged). The stats file (shaped-var2-stats.log) is the
 // observation channel for EVERY incoming control event, logged with
 // name + parameters + timestamp; the MIDI stream itself is NEVER
 // logged (hundreds of events/s would flood).
@@ -32,7 +32,7 @@
 // (baseline); each E1M1 song_end advances to the next variant
 // (1 sched, 2 pipe, 3 neon2) with an emulator reset and E1M1 from
 // the beginning, via a SEPARATE variant-advance path (NOT the
-// deleted song-toggle DoSwitch); after variant 3's song_end the
+// deleted song-toggle DoSwitch); after variant 5's song_end the
 // kernel STOPS into post-song_end idle (silence, clean idle windows,
 // LED heartbeat unchanged, never restart, never loop). Audio silence
 // + the sequence_done line are the done signals; LED-off is NEVER a
@@ -169,7 +169,7 @@ private:
 	void LogLine(const char* pFormat, ...);	// core 2 only (also init, pre-multicore), f_write+f_sync, t= prefixed
 	void WriteWindow(bool bPaused);	// core 2 only: one 5 s stats window line
 	void WriteSongEnd();	// core 2 only: per-song summary (completed)
-	void WriteSequenceDone();	// core 2 only: per-variant totals after variant 3's song_end
+	void WriteSequenceDone();	// core 2 only: per-variant totals after variant 5's song_end
 
 	// One PCM-task iteration (core 3, skeletal shape, UNCHANGED from
 	// togglefix): ACQUIRE-load the published cycle count; if it is
@@ -229,7 +229,7 @@ private:
 	// explicitly (0-3), and a follow-up adding variants extends
 	// those fields mechanically.
 	int m_nCurrentVariant;		// 0 baseline, 1 sched, 2 pipe, 3 neon2
-	bool m_bSequenceDone;		// core 2 only: variant 3's song_end logged, now idle forever
+	bool m_bSequenceDone;		// core 2 only: last variant's song_end logged, now idle forever
 	u64 m_nVarProd[8];		// per-variant output frames (song windows only)
 	u64 m_nVarPcmCyc[8];		// per-variant pcm_cyc sums
 	u64 m_nVarMixCyc[8];		// per-variant mix_cyc sums

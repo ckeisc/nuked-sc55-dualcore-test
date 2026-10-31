@@ -38,7 +38,7 @@
 //   There is no queue-flush API in Circle, so this tail is inherent
 //   to any chunked-write design, mt32-pi's included.
 // - EVENT LOGGING: every incoming CONTROL event is logged to
-//   shaped-var-stats.log with name + parameters + t= timestamp:
+//   shaped-var2-stats.log with name + parameters + t= timestamp:
 //   MiSTer I2C init/down/synth/romset/soundfont/mute/writefail,
 //   variant advances, and sequence_done. The MIDI stream is NEVER
 //   logged (hundreds of events/s would flood). No OSD text is
@@ -51,8 +51,10 @@
 //   The variant auto-sequence is: boot variant 0 (baseline) E1M1 ->
 //   song_end -> variant 1 (sched) E1M1 -> song_end -> variant 2
 //   (pipe) E1M1 -> song_end -> variant 3 (neon2) E1M1 -> song_end ->
-//   STOP (post-song_end idle: silence, clean idle windows, LED
-//   heartbeat unchanged, never restart, never loop). The advance
+//   variant 4 (splitacc) E1M1 -> song_end -> variant 5 (layout) E1M1
+//   -> song_end -> STOP (post-song_end idle: silence, clean idle
+//   windows, LED heartbeat unchanged, never restart, never loop).
+//   The advance
 //   path (DoVariantAdvance) is SEPARATE from the deleted song-toggle
 //   DoSwitch: same Reset + GS_RESET + InitSplitState(true) +
 //   resampler reset, but NO song change, NO cycle line, NO abort
@@ -232,7 +234,7 @@ constexpr u64 StepsPerFrameBudget = 300;
 // Variant auto-sequence (2026-10-31 ~09:23/09:29): NO hardware
 // keys. Variant numbers: 0 baseline, 1 sched, 2 pipe, 3 neon2.
 // Boot starts variant 0; each E1M1 song_end advances (reset +
-// E1M1 from the beginning); after variant 3's song_end the kernel
+// E1M1 from the beginning); after variant 5's song_end the kernel
 // stops into post-song_end idle. Button GPIOs are NEVER read.
 // The variant table itself lives in pcm.cpp (g_pcmVariants,
 // data-driven per 2026-10-31 ~09:39); MaxVariants sizes the
@@ -265,7 +267,7 @@ constexpr u8 MisterSynthVariant = 0xA2;
 constexpr float Sample24BitMax = static_cast<float>((1 << 23) - 1);
 
 // Stats file (SD root) and window length.
-const char MinimalStatsPath[] = "SD:/shaped-var-stats.log";
+const char MinimalStatsPath[] = "SD:/shaped-var2-stats.log";
 constexpr u64 WindowUs = 5000000ULL;	// 5 s -> 240,000 frames at 48 kHz
 
 // Scheduler-free pause for spin waits (this kernel registers no
@@ -873,13 +875,13 @@ void CMinimalApp::WriteSongEnd()
 
 void CMinimalApp::WriteSequenceDone()
 {
-	// Core 2 only, direct from DrainMailboxes after variant 3's
+	// Core 2 only, direct from DrainMailboxes after variant 5's
 	// song_end + window flush (so the totals below are complete at
 	// this line). Per-variant totals across that variant's SONG
 	// windows only (idle windows after this line stop adding, so
 	// this line stays the authoritative totals). Compact field
 	// names (vN_*) keep the line inside LogLine's buffer.
-	LogLine("sequence_done v0_prod=%llu v0_pcm_cyc=%llu v0_mix_cyc=%llu v0_step_cyc=%llu v0_lock_cyc=%llu v1_prod=%llu v1_pcm_cyc=%llu v1_mix_cyc=%llu v1_step_cyc=%llu v1_lock_cyc=%llu v2_prod=%llu v2_pcm_cyc=%llu v2_mix_cyc=%llu v2_step_cyc=%llu v2_lock_cyc=%llu v3_prod=%llu v3_pcm_cyc=%llu v3_mix_cyc=%llu v3_step_cyc=%llu v3_lock_cyc=%llu",
+	LogLine("sequence_done v0_prod=%llu v0_pcm_cyc=%llu v0_mix_cyc=%llu v0_step_cyc=%llu v0_lock_cyc=%llu v1_prod=%llu v1_pcm_cyc=%llu v1_mix_cyc=%llu v1_step_cyc=%llu v1_lock_cyc=%llu v2_prod=%llu v2_pcm_cyc=%llu v2_mix_cyc=%llu v2_step_cyc=%llu v2_lock_cyc=%llu v3_prod=%llu v3_pcm_cyc=%llu v3_mix_cyc=%llu v3_step_cyc=%llu v3_lock_cyc=%llu v4_prod=%llu v4_pcm_cyc=%llu v4_mix_cyc=%llu v4_step_cyc=%llu v4_lock_cyc=%llu v5_prod=%llu v5_pcm_cyc=%llu v5_mix_cyc=%llu v5_step_cyc=%llu v5_lock_cyc=%llu",
 	        static_cast<unsigned long long>(m_nVarProd[0]),
 	        static_cast<unsigned long long>(m_nVarPcmCyc[0]),
 	        static_cast<unsigned long long>(m_nVarMixCyc[0]),
@@ -899,7 +901,17 @@ void CMinimalApp::WriteSequenceDone()
 	        static_cast<unsigned long long>(m_nVarPcmCyc[3]),
 	        static_cast<unsigned long long>(m_nVarMixCyc[3]),
 	        static_cast<unsigned long long>(m_nVarStepCyc[3]),
-	        static_cast<unsigned long long>(m_nVarLockCyc[3]));
+	        static_cast<unsigned long long>(m_nVarLockCyc[3]),
+	        static_cast<unsigned long long>(m_nVarProd[4]),
+	        static_cast<unsigned long long>(m_nVarPcmCyc[4]),
+	        static_cast<unsigned long long>(m_nVarMixCyc[4]),
+	        static_cast<unsigned long long>(m_nVarStepCyc[4]),
+	        static_cast<unsigned long long>(m_nVarLockCyc[4]),
+	        static_cast<unsigned long long>(m_nVarProd[5]),
+	        static_cast<unsigned long long>(m_nVarPcmCyc[5]),
+	        static_cast<unsigned long long>(m_nVarMixCyc[5]),
+	        static_cast<unsigned long long>(m_nVarStepCyc[5]),
+	        static_cast<unsigned long long>(m_nVarLockCyc[5]));
 }
 
 void CMinimalApp::PCMTaskIteration()
@@ -1192,7 +1204,7 @@ void CMinimalApp::DrainMailboxes()
 	// pause loop; never mid-step. Song-end (set while stepping) is
 	// written first, then the partial window is flushed (so every
 	// window belongs entirely to one variant), then the sequence
-	// advances (variant < 3) or finishes (variant 3: sequence_done,
+	// advances (variant < g_pcmVariantCount - 1) or finishes (last variant: sequence_done,
 	// then post-song_end idle forever). No keys exist in this kernel,
 	// so there is no key branch and no pause/resume path from input
 	// (the AudioLoop pause branch is unreachable: m_bPaused is never
@@ -1683,7 +1695,7 @@ void CMinimalApp::AudioLoop()
 		MiniPause();
 	SplitDMB();
 	const bool bPmu3Ok = m_bPmu3Done && m_bPmu3Ok;
-	LogLine("boot kernel=mt32-shaped-var split=on song=%s rate=%u out_rate=%u out_chunk=%u devq=%u romset=%s audio=i2s pmc2=%s pmc3=%s seq=auto variants=0:baseline,1:sched,2:pipe,3:neon2",
+	LogLine("boot kernel=mt32-shaped-var2 split=on song=%s rate=%u out_rate=%u out_chunk=%u devq=%u romset=%s audio=i2s pmc2=%s pmc3=%s seq=auto variants=0:baseline,1:sched,2:pipe,3:neon2,4:splitacc,5:layout",
 	        SongName(m_nCurrentSong),
 	        m_nNativeRate,
 	        OutRate,
@@ -1692,7 +1704,7 @@ void CMinimalApp::AudioLoop()
 	        m_pRomsetName != nullptr ? m_pRomsetName : "unknown",
 	        m_bPmu2Ok ? "ok" : "fail",
 	        bPmu3Ok ? "ok" : "fail");
-	LogLine("legend win: due is wall-clock (elapsed*48000); pct = prod*100/due; window 0 excludes the 2 startup chunks (512 frames) so it reads ~99.8%% on a perfect run -- judge sustained windows; tick/lookahead/rpc waits+us, write_hw/irq_hw, write_ovf/irq_ovf are 0 (machinery removed); max_lag is the peak published-minus-rendered lag since (re)activation; ring_drops is the drop-oldest total since boot (inherited wart: togglefix showed 15832 at the toggle, then flat -- mechanism unpinned, reported not hidden); core2_pct is the step-loop wall share; resample_us is the resampler wall time; devq_maxavail is peak device FREE space (near 2048 = device nearly starved; CORRECTED vs old shaped, which measured queued); devq_low counts chunks with <1 chunk QUEUED at Write time; sound_drops must be 0 by construction (corrected free-space wait); sustained pct ~80-85 is the ENGINE ceiling (togglefix: ~85%% real-time), not a failure -- pct=100 needs a real-time engine; DIAG fields: lock_us = core-2 state-lock spin-wait wall in the window, lock_waits = lock ops taken, mcu_us = step-loop wall minus lock_us (pure MCU stepping + peripherals); PMU fields: var = variant this window ran under (0 baseline, 1 sched, 2 pipe, 3 neon2); pcm_cyc = core-3 total PCM task cycles, mix_cyc = core-3 voice-mix cycles per batch, step_cyc = core-2 MCU stepping cycles only, lock_cyc = core-2 state-lock spin cycles; every cycle value is NOP-corrected (double-read cost subtracted, clamped at 0); a failed counter (boot pmc2/pmc3=fail) reports 0 for its fields -- the boot line is the validity signal");
+	LogLine("legend win: due is wall-clock (elapsed*48000); pct = prod*100/due; window 0 excludes the 2 startup chunks (512 frames) so it reads ~99.8%% on a perfect run -- judge sustained windows; tick/lookahead/rpc waits+us, write_hw/irq_hw, write_ovf/irq_ovf are 0 (machinery removed); max_lag is the peak published-minus-rendered lag since (re)activation; ring_drops is the drop-oldest total since boot (inherited wart: togglefix showed 15832 at the toggle, then flat -- mechanism unpinned, reported not hidden); core2_pct is the step-loop wall share; resample_us is the resampler wall time; devq_maxavail is peak device FREE space (near 2048 = device nearly starved; CORRECTED vs old shaped, which measured queued); devq_low counts chunks with <1 chunk QUEUED at Write time; sound_drops must be 0 by construction (corrected free-space wait); sustained pct ~80-85 is the ENGINE ceiling (togglefix: ~85%% real-time), not a failure -- pct=100 needs a real-time engine; DIAG fields: lock_us = core-2 state-lock spin-wait wall in the window, lock_waits = lock ops taken, mcu_us = step-loop wall minus lock_us (pure MCU stepping + peripherals); PMU fields: var = variant this window ran under (0 baseline, 1 sched, 2 pipe, 3 neon2, 4 splitacc, 5 layout); pcm_cyc = core-3 total PCM task cycles, mix_cyc = core-3 voice-mix cycles per batch, step_cyc = core-2 MCU stepping cycles only, lock_cyc = core-2 state-lock spin cycles; every cycle value is NOP-corrected (double-read cost subtracted, clamped at 0); a failed counter (boot pmc2/pmc3=fail) reports 0 for its fields -- the boot line is the validity signal");
 	LogLine("legend events: every control event is logged with t= timestamp + action -- variant (n/from/to/name on each advance), song_end (with var), sequence_done (per-variant totals vN_prod/vN_pcm_cyc/vN_mix_cyc/vN_step_cyc/vN_lock_cyc), mister_init/mister_down/mister_synth/mister_romset/mister_sfindex/mister_mute/mister_writefail, sound_drop/sound_restart/sound_start_fail, mister_drop. NO keys exist: no key lines, no cycle lines, no song_aborted lines (advances happen only on completed songs). The MIDI stream is NEVER logged. No OSD text is attempted (3-byte protocol has no text field); the MiSTer's own pop-ups on status change are unchanged; the variant NUMBER is the status soundfont byte {0xA2, 0xFF, variant} (documented minimal-kernel-only hack) and the variant NAME is the SSD1306 mirror at 0x3C (best-effort, core 1 only). Audio leaves via the Pi I2S output, NOT through the MiSTer. LED: core-2 heartbeat, ~1 Hz while windows clean, held Off on bad windows, frozen while paused or device-space stalled; LED-off is NEVER a done signal.");
 
 	// ACT heartbeat (core 2 only, togglefix semantics): LED off from
@@ -2025,7 +2037,7 @@ bool CMinimalApp::Initialize()
 
 	// Song 0 (E1M1) starts automatically at boot with variant 0
 	// (baseline). NO keys: the auto-sequence advances variants on
-	// song_end (DrainMailboxes) and stops after variant 3.
+	// song_end (DrainMailboxes) and stops after variant 5.
 	SetSongCursor(0);
 	m_nCurrentSong = 0;
 

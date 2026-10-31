@@ -1496,10 +1496,9 @@ index 0000000..9ea3a05
 +NukedProfileClockFn NukedProfileClock();
 +NukedProfileData& NukedProfile();
 diff --git a/src/backend/pcm.cpp b/src/backend/pcm.cpp
-index 7aebaf1..2102df8 100644
 --- a/src/backend/pcm.cpp
 +++ b/src/backend/pcm.cpp
-@@ -1101,6 +1101,12 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+@@ -1101,6 +1101,12 @@
          pcm.rcsum[0] = 0;
          pcm.rcsum[1] = 0;
  
@@ -1512,7 +1511,7 @@ index 7aebaf1..2102df8 100644
          for (int slot = 0; slot < pcm.config.reg_slots; slot++)
          {
              uint32_t *ram1 = pcm.ram1[slot];
-@@ -1573,6 +1579,16 @@ void PCM_Update(pcm_t& pcm, uint64_t cycles)
+@@ -1573,6 +1579,16 @@
              }
          }
  
@@ -1529,7 +1528,7 @@ index 7aebaf1..2102df8 100644
          if (pcm.nfs)
          {
              pcm.ram2[31][7] |= 0x20;
-@@ -1612,3 +1628,3294 @@ uint32_t PCM_GetOutputFrequency(const pcm_t& pcm)
+@@ -1612,3 +1628,5634 @@
          return freq / 2;
      }
  }
@@ -4796,15 +4795,2355 @@ index 7aebaf1..2102df8 100644
 +}
 +#undef NEON_MIX_TAIL_V2
 +
++#define NEON_MIX_TAIL_V2
++void PCM_Update_Splitacc(pcm_t& pcm, uint64_t cycles)
++{
++    // mt32-pi profiling: only calls that will render at least one tick
++    // take clock readings, so the common no-op call costs one comparison.
++    const NukedProfileClockFn pProfileClock = NukedProfileClock();
++    const uint64_t nProfileStart = (pProfileClock && pcm.cycles < cycles) ? pProfileClock() : 0;
++
++    while (pcm.cycles < cycles)
++    {
++        // mt32-pi dual-core split: apply the register writes (and IRQ-ACK
++        // clears) due before this tick, in step order. No-op when the
++        // split is inactive (g_splitT null) or for JV880 (bypassed).
++        if (g_splitT)
++            g_splitT->DrainBeforeTick(pcm);
++
++        const uint32_t voice_active = pcm.voice_mask & pcm.voice_mask_pending;
++        { // final mixing
++            int shifter = pcm.ram2[30][10];
++            int xr = ((shifter >> 0) ^ (shifter >> 1) ^ (shifter >> 7) ^ (shifter >> 12)) & 1;
++            shifter = (shifter >> 1) | (xr << 15);
++            pcm.ram2[30][10] = (uint16_t)shifter;
++
++            pcm.accum_l = addclip20(pcm.accum_l, (int32_t)pcm.ram1[30][0], 0);
++            pcm.accum_r = addclip20(pcm.accum_r, (int32_t)pcm.ram1[30][1], 0);
++
++            pcm.ram1[30][2] = (uint32_t)addclip20(pcm.accum_l,
++                (int32_t)(pcm.config.orval | (shifter & pcm.config.noise_mask)), 0);
++
++            pcm.ram1[30][4] = (uint32_t)addclip20(pcm.accum_r,
++                (int32_t)(pcm.config.orval | (shifter & pcm.config.noise_mask)), 0);
++
++            pcm.ram1[30][0] = (uint32_t)(pcm.accum_l & pcm.config.write_mask);
++            pcm.ram1[30][1] = (uint32_t)(pcm.accum_r & pcm.config.write_mask);
++            
++
++            int32_t samp_l = (int32_t)((pcm.ram1[30][2] & (uint32_t)(~pcm.config.write_mask)) << 12);
++            int32_t samp_r = (int32_t)((pcm.ram1[30][4] & (uint32_t)(~pcm.config.write_mask)) << 12);
++
++            MCU_PostSample(*pcm.mcu, {samp_l, samp_r});
++
++            xr = ((shifter >> 0) ^ (shifter >> 1) ^ (shifter >> 7) ^ (shifter >> 12)) & 1;
++            shifter = (shifter >> 1) | (xr << 15);
++
++            pcm.accum_l = addclip20(pcm.accum_l, (int32_t)pcm.ram1[30][0], 0);
++            pcm.accum_r = addclip20(pcm.accum_r, (int32_t)pcm.ram1[30][1], 0);
++
++            pcm.ram1[30][3] = (uint32_t)addclip20(pcm.accum_l,
++                (int32_t)(pcm.config.orval | (shifter & pcm.config.noise_mask)), 0);
++
++            pcm.ram1[30][5] = (uint32_t)addclip20(pcm.accum_r,
++                (int32_t)(pcm.config.orval | (shifter & pcm.config.noise_mask)), 0);
++
++            if (pcm.enable_oversampling && pcm.config.oversampling) // oversampling
++            {
++                pcm.ram2[30][10] = (uint16_t)shifter;
++
++                pcm.ram1[30][0] = (uint32_t)(pcm.accum_l & pcm.config.write_mask);
++                pcm.ram1[30][1] = (uint32_t)(pcm.accum_r & pcm.config.write_mask);
++
++
++                samp_l = (int32_t)((pcm.ram1[30][3] & (uint32_t)(~pcm.config.write_mask)) << 12);
++                samp_r = (int32_t)((pcm.ram1[30][5] & (uint32_t)(~pcm.config.write_mask)) << 12);
++
++                MCU_PostSample(*pcm.mcu, {samp_l, samp_r});
++            }
++        }
++
++        { // global counter for envelopes
++            if (!pcm.nfs)
++                pcm.tv_counter = pcm.ram2[31][8]; // fixme
++
++            pcm.tv_counter -= 1;
++
++            pcm.tv_counter &= 0x3fff;
++        }
++
++        // chorus/reverb
++
++        { // fixme
++            if (pcm.ram2[31][8] & 0x8000)
++                pcm.ram2[31][9] = pcm.ram2[31][8] & 0x7fff;
++            else
++                pcm.ram2[31][10] = pcm.ram2[31][8] & 0x7fff;
++
++            if ((0x4000 - pcm.ram2[31][8]) & 0x8000)
++                pcm.ram2[31][10] = (0x4000 - pcm.ram2[31][8]) & 0x7fff;
++            else
++                pcm.ram2[31][9] = (0x4000 - pcm.ram2[31][8]) & 0x7fff;
++        }
++
++        {
++            int v1 = pcm.ram2[31][1];
++
++            int m1 = multi((int32_t)pcm.ram1[29][1], (int8_t)(v1 >> 8)) >> 5; // 14
++            int m2 = multi(pcm.rcsum[1], (int8_t)(v1 & 255)) >> 5; // 15
++
++            pcm.ram1[29][1] = (uint32_t)addclip20(m1 >> 1, m2 >> 1, (m1 | m2) & 1); // 16
++        }
++
++        {
++            const bool okey = (pcm.ram2[31][7] & 0x20) != 0;
++            const bool key = 1;
++            const bool active = okey && key;
++            int u = 0;
++            calc_tv(pcm, 1, pcm.ram2[30][0], &pcm.ram2[30][9], active, &u);
++        }
++
++        {
++            int v1 = pcm.ram2[30][1];
++            int m1 = multi((int32_t)pcm.ram1[29][0], (int8_t)(v1 >> 8)) >> 5; // 17
++            int m2 = multi(pcm.rcsum[0], (int8_t)(v1 & 255)) >> 5; // 18
++
++            pcm.ram1[29][0] = (uint32_t)addclip20(m1 >> 1, m2 >> 1, (m1 | m2) & 1); // 19
++        }
++
++        int rcadd[6] = {};
++        int rcadd2[6] = {};
++
++        {
++            {
++                // 1
++                int v1 = pcm.ram2[30][4];
++                int m1 = multi((int32_t)pcm.ram1[29][0], (int8_t)(v1 >> 8)) >> 6;
++                int v2 = 0;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][1] + pcm.tv_counter, 1);
++                int s2 = eram_unpack(pcm, pcm.ram2[28][1] + pcm.tv_counter);
++                if ((v1 & 0x30) != 0)
++                {
++                    v2 = s1;
++                }
++                int v3 = addclip20(m1, v2 ^ 0xfffff, 1);
++                pcm.ram1[29][4] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[29][5] = (uint32_t)addclip20(m2 >> 1, s2, m2 & 1);
++            }
++            {
++                // 2
++                int v1 = pcm.ram2[30][4];
++                int v2 = 0;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][2] + pcm.tv_counter, 1);
++                int s2 = eram_unpack(pcm, pcm.ram2[28][2] + pcm.tv_counter);
++                if ((v1 & 0x30) != 0)
++                {
++                    v2 = s1;
++                }
++                int v3 = addclip20((int32_t)pcm.ram1[29][5], v2 ^ 0xfffff, 1);
++                pcm.ram1[29][5] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][0] = (uint32_t)addclip20(m2 >> 1, s2, m2 & 1);
++            }
++            {
++                // 3
++                int v1 = pcm.ram2[30][4];
++                int v2 = 0;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][3] + pcm.tv_counter, 1);
++                int s2 = eram_unpack(pcm, pcm.ram2[28][3] + pcm.tv_counter);
++                if ((v1 & 0x30) != 0)
++                {
++                    v2 = s1;
++                }
++                int v3 = addclip20((int32_t)pcm.ram1[28][0], v2 ^ 0xfffff, 1);
++                pcm.ram1[28][0] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][1] = (uint32_t)addclip20(m2 >> 1, s2, m2 & 1);
++
++
++                pcm.ram1[28][2] = (uint32_t)eram_unpack(pcm, pcm.ram2[28][5] + pcm.tv_counter);
++            }
++            {
++                // 4
++                int v1 = pcm.ram2[30][5];
++                int v2 = 0;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][4] + pcm.tv_counter, 1);
++                int s2 = eram_unpack(pcm, pcm.ram2[28][4] + pcm.tv_counter);
++                if ((v1 & 0x30) != 0)
++                {
++                    v2 = s1;
++                }
++                int v3 = addclip20((int32_t)pcm.ram1[28][1], v2 ^ 0xfffff, 1);
++                pcm.ram1[28][1] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][3] = (uint32_t)addclip20(m2 >> 1, s2, m2 & 1);
++
++
++                pcm.ram1[28][4] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][1] + pcm.tv_counter);
++            }
++            {
++                // 5
++
++                int v1 = pcm.ram2[30][7];
++                int m1 = multi((int32_t)pcm.ram1[29][2], (int8_t)(v1 >> 8)) >> 5;
++                int s1 = eram_unpack(pcm, pcm.ram2[29][0] + pcm.tv_counter);
++                int m2 = multi(s1, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[29][2] = (uint32_t)addclip20(m1 >> 1, m2 >> 1, (m1 | m2) & 1);
++
++                eram_pack(pcm, pcm.ram2[28][0] + pcm.tv_counter, pcm.ram1[29][4]);
++            }
++            {
++                // 6
++
++                int v1 = pcm.ram2[30][8];
++                int m1 = multi((int32_t)pcm.ram1[29][3], (int8_t)(v1 >> 8)) >> 5;
++                int s1 = eram_unpack(pcm, pcm.ram2[29][8] + pcm.tv_counter);
++                int m2 = multi(s1, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[29][3] = (uint32_t)addclip20(m1 >> 1, m2 >> 1, (m1 | m2) & 1);
++
++                eram_pack(pcm, pcm.ram2[28][1] + pcm.tv_counter, pcm.ram1[29][5]);
++
++                eram_pack(pcm, pcm.ram2[28][2] + pcm.tv_counter, pcm.ram1[28][0]);
++            }
++            {
++                // 7
++
++                int v1 = pcm.ram2[30][9];
++                int v2 = (int)pcm.ram1[28][3];
++                int m1 = multi((int32_t)pcm.ram1[29][2], (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi((int32_t)pcm.ram1[29][3], (int8_t)(v1 >> 8)) >> 5;
++                pcm.ram1[28][3] = (uint32_t)addclip20(v2, m1 >> 1, m1 & 1);
++                pcm.ram1[28][5] = (uint32_t)addclip20(v2, m2 >> 1, m2 & 1);
++
++                eram_pack(pcm, pcm.ram2[28][3] + pcm.tv_counter, pcm.ram1[28][1]);
++            }
++            {
++                // 8
++
++                int v1 = pcm.ram2[30][6];
++                int m1 = multi((int32_t)pcm.ram1[28][2], (int8_t)(v1 >> 8)) >> 5;
++
++                int v2 = addclip20((int32_t)pcm.ram1[28][3], m1 >> 1, m1 & 1);
++                pcm.ram1[28][3] = (uint32_t)v2;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][2] = (uint32_t)addclip20((int32_t)pcm.ram1[28][2], m2 >> 1, m2 & 1);
++
++
++                pcm.ram1[28][1] = (uint32_t)eram_unpack(pcm, pcm.ram2[28][9] + pcm.tv_counter);
++            }
++            {
++                // 9
++
++                int v1 = pcm.ram2[30][6];
++                int m1 = multi((int32_t)pcm.ram1[28][4], (int8_t)(v1 >> 8)) >> 5;
++
++                int v2 = addclip20((int32_t)pcm.ram1[28][5], m1 >> 1, m1 & 1);
++                pcm.ram1[28][5] = (uint32_t)v2;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][4] = (uint32_t)addclip20((int32_t)pcm.ram1[28][4], m2 >> 1, m2 & 1);
++
++
++                pcm.ram1[29][4] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][5] + pcm.tv_counter);
++            }
++            {
++                // 10
++
++                int v1 = pcm.ram2[30][6];
++                int v2 = (int)pcm.ram1[28][1];
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][8] + pcm.tv_counter);
++                int v3 = addclip20(m1 >> 1, s1, m1 & 1);
++                pcm.ram1[28][1] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[29][5] = (uint32_t)addclip20(m2 >> 1, v2, m2 & 1);
++
++                eram_pack(pcm, pcm.ram2[28][4] + pcm.tv_counter, pcm.ram1[28][3]);
++            }
++            {
++                // 11
++
++                int v1 = pcm.ram2[30][6];
++                int v2 = (int)pcm.ram1[29][4];
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int s1 = eram_unpack(pcm, pcm.ram2[29][4] + pcm.tv_counter);
++                int v3 = addclip20(m1 >> 1, s1, m1 & 1);
++                pcm.ram1[29][4] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][0] = (uint32_t)addclip20(m2 >> 1, v2, m2 & 1);
++
++
++                eram_pack(pcm, pcm.ram2[28][5] + pcm.tv_counter, pcm.ram1[28][2]);
++
++                eram_pack(pcm, pcm.ram2[29][0] + pcm.tv_counter, pcm.ram1[28][5]);
++            }
++            {
++                // 12
++
++                pcm.ram1[28][5] = (uint32_t)eram_unpack(pcm, pcm.ram2[28][6] + pcm.tv_counter);
++            }
++
++            {
++                // 13
++
++                int s1 = eram_unpack(pcm, pcm.ram2[28][10] + pcm.tv_counter);
++                pcm.ram1[28][5] = (uint32_t)addclip20((int32_t)pcm.ram1[28][5], s1, 0);
++
++                pcm.ram1[28][2] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][2] + pcm.tv_counter);
++            }
++
++            {
++                // 14
++
++                int s1 = eram_unpack(pcm, pcm.ram2[29][6] + pcm.tv_counter);
++                int t1 = addclip20(s1, (int32_t)pcm.ram1[28][2], 0); // 6
++
++                pcm.ram1[28][5] = (uint32_t)addclip20(t1, (int32_t)pcm.ram1[28][5], 0);
++
++                pcm.ram1[28][2] = (uint32_t)eram_unpack(pcm, pcm.ram2[28][7] + pcm.tv_counter);
++            }
++
++            {
++                // 15
++
++                int s1 = eram_unpack(pcm, pcm.ram2[28][11] + pcm.tv_counter);
++                pcm.ram1[28][2] = (uint32_t)addclip20((int32_t)pcm.ram1[28][2], s1, 0);
++
++                pcm.ram1[28][3] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][3] + pcm.tv_counter);
++            }
++
++            {
++                // 16
++
++                int s1 = eram_unpack(pcm, pcm.ram2[29][7] + pcm.tv_counter);
++                int t1 = addclip20(s1, (int32_t)pcm.ram1[28][2], 0);
++                pcm.ram1[28][2] = (uint32_t)addclip20(t1, (int32_t)pcm.ram1[28][3], 0);
++
++
++                eram_pack(pcm, pcm.ram2[29][1] + pcm.tv_counter, pcm.ram1[28][4]);
++
++                eram_pack(pcm, pcm.ram2[28][8] + pcm.tv_counter, pcm.ram1[28][1]);
++            }
++
++            {
++                // 17
++                int v1 = pcm.ram2[30][2];
++                int v2 = (int)pcm.ram1[28][5];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++
++                rcadd[0] = m1;
++
++                rcadd2[0] = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                int t1 = eram_unpack(pcm, pcm.ram2[29][10] + pcm.tv_counter + 1); //? 3a6e
++                eram_pack(pcm, pcm.ram2[28][9] + pcm.tv_counter, pcm.ram1[29][5]);
++                pcm.ram1[29][5] = (uint32_t)t1;
++            }
++
++            {
++                // 18
++                int v1 = pcm.ram2[30][3];
++                int v2 = (int)pcm.ram1[28][2];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++
++                rcadd[1] = m1;
++
++                rcadd2[1] = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                pcm.ram1[28][1] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][11] + pcm.tv_counter + 1); //? 3a1e
++            }
++            {
++                // 19
++
++                int v1 = pcm.ram2[31][9];
++
++                int s1 = eram_unpack(pcm, pcm.ram2[29][10] + pcm.tv_counter); //? 3a6d
++
++                eram_pack(pcm, pcm.ram2[29][4] + pcm.tv_counter, pcm.ram1[29][4]);
++
++                int m1 = multi(s1, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi((int32_t)pcm.ram1[29][5], (int8_t)(v1 >> 8)) >> 5;
++
++                int t2 = addclip20(s1, (m1 >> 1) ^ 0xfffff, 1);
++
++                pcm.ram1[29][5] = (uint32_t)addclip20(t2, m2 >> 1, m2 & 1);
++            }
++            {
++                // 20
++
++                int v1 = pcm.ram2[31][10];
++
++                int s1 = eram_unpack(pcm, pcm.ram2[29][11] + pcm.tv_counter); //? 3a1d
++
++                eram_pack(pcm, pcm.ram2[29][5] + pcm.tv_counter, pcm.ram1[28][0]);
++
++                int m1 = multi(s1, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi((int32_t)pcm.ram1[28][1], (int8_t)(v1 >> 8)) >> 5;
++
++                int t2 = addclip20(s1, (m1 >> 1) ^ 0xfffff, 1);
++
++                pcm.ram1[28][1] = (uint32_t)addclip20(t2, m2 >> 1, m2 & 1);
++
++                eram_pack(pcm, pcm.ram2[29][9] + pcm.tv_counter, pcm.ram1[29][1]);
++            }
++            {
++                // 21
++
++                int v1 = pcm.ram2[31][2];
++                int v2 = (int)pcm.ram1[29][5];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                rcadd[2] = m1;
++                rcadd2[2] = m2;
++            }
++            {
++                // 22
++
++                int v1 = pcm.ram2[31][3];
++                int v2 = (int)pcm.ram1[29][5];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                rcadd[3] = m1;
++                rcadd2[3] = m2;
++            }
++            {
++                // 23
++
++                int v1 = pcm.ram2[31][4];
++                int v2 = (int)pcm.ram1[28][1];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                rcadd[4] = m1;
++                rcadd2[4] = m2;
++            }
++            {
++                // 31
++
++                int v1 = pcm.ram2[31][5];
++                int v2 = (int)pcm.ram1[28][1];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                rcadd[5] = m1;
++                rcadd2[5] = m2;
++
++                {
++                    // address generator
++
++                    const bool key = 1;
++                    const bool okey = (pcm.ram2[31][7] & 0x20) != 0;
++                    const bool active = key && okey;
++                    const bool kon = key && !okey;
++
++                    bool b15 = (pcm.ram2[31][8] & 0x8000) != 0; // 0
++                    const bool b6 = (pcm.ram2[31][7] & 0x40) != 0; // 1
++                    const bool b7 = (pcm.ram2[31][7] & 0x80) != 0; // 1
++                    int old_nibble = (pcm.ram2[31][7] >> 12) & 15; // 1
++                    (void)old_nibble; // unused
++
++                    int address = (int)pcm.ram1[31][4]; // 0
++                    int address_end = (int)pcm.ram1[31][0]; // 1 or 2
++                    int address_loop = (int)pcm.ram1[31][2]; // 2 or 1
++
++                    int sub_phase = (pcm.ram2[31][8] & 0x3fff); // 1
++                    int interp_ratio = (sub_phase >> 7) & 127;
++                    (void)interp_ratio; // unused
++                    sub_phase += pcm.ram2[pcm.ram2[31][7] & 31][0]; // 5
++                    int sub_phase_of = (sub_phase >> 14) & 7;
++                    if (pcm.nfs)
++                    {
++                        pcm.ram2[31][8] &= ~0x3fff;
++                        pcm.ram2[31][8] |= sub_phase & 0x3fff;
++                    }
++
++
++                    // address 0
++                    int address_cnt = address;
++
++                    int cmp1 = b15 ? address_loop : address_end;
++                    int cmp2 = address_cnt;
++                    bool address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 9
++                    bool next_b15 = b15;
++
++                    int next_address = address_cnt; // 11
++
++                    cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++                    cmp2 = address_cnt;
++                    int address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++                    const bool address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++                    const bool address_sub = !address_cmp && b6 && b15;
++                    if (b7)
++                        address_cnt2 -= address_add - address_sub;
++                    else
++                        address_cnt2 += address_add - address_sub;
++                    address_cnt = address_cnt2 & 0xfffff; // 11
++                    b15 = b6 && (b15 ^ address_cmp); // 11
++
++                    cmp1 = b15 ? address_loop : address_end;
++                    cmp2 = address_cnt;
++                    address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 13
++
++                    if (sub_phase_of >= 1)
++                    {
++                        next_address = address_cnt; // 13
++                        next_b15 = b15;
++                    }
++
++                    if (active && pcm.nfs)
++                        pcm.ram1[31][4] = (uint32_t)next_address;
++
++                    if (pcm.nfs)
++                    {
++                        pcm.ram2[31][8] &= ~0x8000;
++                        pcm.ram2[31][8] |= (uint16_t)(next_b15 << 15);
++                    }
++
++                    int t1 = address_loop; // 18
++                    int t2 = (int)pcm.ram1[31][4] - t1; // 19
++                    int t3 = address_end - t2; // 20
++                    int t4 = (int)pcm.ram1[31][4]; // 23
++
++                    pcm.ram2[29][10] = (uint16_t)t3;
++                    pcm.ram2[29][11] = (uint16_t)t4;
++                }
++            }
++        }
++
++        pcm.ram1[31][1] = 0;
++        pcm.ram1[31][3] = 0;
++        pcm.rcsum[0] = 0;
++        pcm.rcsum[1] = 0;
++
++        // Split accumulators (even/odd slots) for the mix bus and the
++        // reverb/chorus sums. Each holds the EXACT sum of its slots'
++        // [sx20(term) + cin] contributions plus its slots' slot2
++        // injection terms -- no intermediate sx20 wrap of the running
++        // sum. Per-slot terms are < 2^19+1 in magnitude, <= ~19 terms
++        // per accumulator, so no int32 overflow (totals < 2^25).
++        // Combined once at tick end; see the combine block below.
++        int32_t accL0 = 0, accL1 = 0, accR0 = 0, accR1 = 0;
++        int32_t accC00 = 0, accC01 = 0, accC10 = 0, accC11 = 0;
++        // PMU (shaped-var): voice-mix start. The accumulation follows
++        // this construct (after its close, before the post-loop nfs
++        // block). Skipped when g_splitT is null: in single-threaded
++        // mode core 2 never calls the split batches, and the
++        // single-threaded PCM_Update call is not a core-3 batch.
++        const uint64_t nMixStartCyc = g_splitT ? PMU_ReadCycles() : 0;
++        for (int slot = 0; slot < pcm.config.reg_slots; slot++)
++        {
++            uint32_t *ram1 = pcm.ram1[slot];
++            uint16_t *ram2 = pcm.ram2[slot];
++            const bool okey = (ram2[7] & 0x20) != 0;
++            const bool key = (voice_active >> slot) & 1;
++
++            const bool active = okey && key;
++            const bool kon = key && !okey;
++
++            // address generator
++
++            bool b15 = (ram2[8] & 0x8000) != 0; // 0
++            const bool b6 = (ram2[7] & 0x40) != 0; // 1
++            const bool b7 = (ram2[7] & 0x80) != 0; // 1
++            int hiaddr = (ram2[7] >> 8) & 15; // 1
++            int old_nibble = (ram2[7] >> 12) & 15; // 1
++
++            int address = (int)ram1[4]; // 0
++            int address_end = (int)ram1[0]; // 1 or 2
++            int address_loop = (int)ram1[2]; // 2 or 1
++
++            int cmp1 = b15 ? address_loop : address_end;
++            int cmp2 = address;
++            const bool nibble_cmp1 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 2
++            bool irq_flag = 0;
++
++            // fixme:
++            if (kon)
++                irq_flag = ((cmp1 + address_loop) & 0x100000) != 0;
++            else
++                irq_flag = ((address + ((-address_loop) & 0xfffff)) & 0x100000) != 0;
++            irq_flag ^= b7;
++
++            int nibble_address = (!b6 && nibble_cmp1) ? address_loop : address; // 3
++            const bool address_b4 = (nibble_address & 0x10) != 0;
++            int wave_address = nibble_address >> 5;
++            const bool xor2 = (address_b4 ^ b7);
++            const bool check1 = xor2 && active;
++            const bool xor1 = (b15 ^ !nibble_cmp1);
++            const bool nibble_add = b6 ? check1 && xor1 : (!nibble_cmp1 && check1);
++            const bool nibble_subtract = b6 && !xor1 && active && !xor2;
++            if (b7)
++                wave_address -= nibble_add - nibble_subtract;
++            else
++                wave_address += nibble_add - nibble_subtract;
++            wave_address &= 0xfffff;
++
++            int newnibble = PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | wave_address));
++            const bool newnibble_sel = address_b4 ^ ((b6 || !nibble_cmp1) && okey);
++            if (newnibble_sel)
++                newnibble = (newnibble >> 4) & 15;
++            else
++                newnibble &= 15;
++
++            int sub_phase = (ram2[8] & 0x3fff); // 1
++            int interp_ratio = (sub_phase >> 7) & 127;
++            sub_phase += pcm.ram2[ram2[7] & 31][0]; // 5
++            int sub_phase_of = (sub_phase >> 14) & 7;
++            if (pcm.nfs)
++            {
++                ram2[8] &= ~0x3fff;
++                ram2[8] |= sub_phase & 0x3fff;
++            }
++
++
++            // address 0
++            int address_cnt = address;
++            int samp0 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 18
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp2 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 8
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            bool address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 9
++
++            int next_address = address_cnt; // 11
++            bool usenew = !nibble_cmp2;
++            bool next_b15 = b15;
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            int address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            bool address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            bool address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 11
++            b15 = b6 && (b15 ^ address_cmp); // 11
++
++            int samp1 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 20
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp3 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 12
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 13
++
++            if (sub_phase_of >= 1)
++            {
++                next_address = address_cnt; // 13
++                usenew = !nibble_cmp3;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 15
++            b15 = b6 && (b15 ^ address_cmp); // 15
++
++            int samp2 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 1
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp4 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 16
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 17
++
++            if (sub_phase_of >= 2)
++            {
++                next_address = address_cnt; // 17
++                usenew = !nibble_cmp4;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 19
++            b15 = b6 && (b15 ^ address_cmp); // 19
++
++            int samp3 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 5
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp5 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 20
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 21
++
++            if (sub_phase_of >= 3)
++            {
++                next_address = address_cnt; // 21
++                usenew = !nibble_cmp5;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 23
++            // b15 = b6 && (b15 ^ address_cmp); // 23
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp6 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 24
++
++            if (sub_phase_of >= 4)
++            {
++                next_address = address_cnt; // 1
++                usenew = !nibble_cmp6;
++                // b15 is not updated?
++            }
++
++            if (active && pcm.nfs)
++                ram1[4] = (uint32_t)next_address;
++
++            if (pcm.nfs)
++            {
++                ram2[8] &= ~0x8000;
++                ram2[8] |= (uint16_t)(next_b15 << 15);
++            }
++
++            // dpcm
++
++            // 18
++            int reference = (int)ram1[5];
++
++            // 19
++            int preshift = samp0 << 10;
++            int select_nibble = nibble_cmp2 ? old_nibble : newnibble;
++            int shift = (10 - select_nibble) & 15;
++
++            int shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 1)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp1 << 10;
++            select_nibble = nibble_cmp3 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 2)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp2 << 10;
++            select_nibble = nibble_cmp4 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 3)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp3 << 10;
++            select_nibble = nibble_cmp5 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 4)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            // interpolation
++
++            int test = (int)ram1[5];
++
++            int step0 = multi(interp_lut[0][interp_ratio] << 6, (int8_t)samp0) >> 8;
++            select_nibble = nibble_cmp2 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step0 =  (step0 << 1) >> shift;
++
++            test = addclip20(test, step0 >> 1, step0 & 1);
++
++
++            int step1 = multi(interp_lut[1][interp_ratio] << 6, (int8_t)samp1) >> 8;
++            select_nibble = nibble_cmp3 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step1 = (step1 << 1) >> shift;
++
++            test = addclip20(test, step1 >> 1, step1 & 1);
++
++            int step2 = multi(interp_lut[2][interp_ratio] << 6, (int8_t)samp2) >> 8;
++            select_nibble = nibble_cmp4 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step2 = (step2 << 1) >> shift;
++
++            int reg1 = (int)ram1[1];
++            int reg3 = (int)ram1[3];
++            int reg2_6 = (ram2[6] >> 8) & 127;
++
++            test = addclip20(test, step2 >> 1, step2 & 1);
++
++            int filter = ram2[11];
++            int v3;
++
++            if (pcm.mcu->is_mk1)
++            {
++                int mult1 = multi(reg1, (int8_t)(filter >> 8)); // 8
++                int mult2 = multi(reg1, (int8_t)((filter >> 1) & 127)); // 9
++                int mult3 = multi(reg1, (int8_t)reg2_6); // 10
++
++                int v2 = addclip20(reg3, mult1 >> 6, (mult1 >> 5) & 1); // 9
++                int v1 = addclip20(v2, mult2 >> 13, (mult2 >> 12) & 1); // 10
++                int subvar = addclip20(v1, (mult3 >> 6), (mult3 >> 5) & 1); // 11
++
++                ram1[3] = (uint32_t)v1;
++
++                v3 = addclip20(test, subvar ^ 0xfffff, 1); // 12
++
++                int mult4 = multi(v3, (int8_t)(filter >> 8));
++                int mult5 = multi(v3, (int8_t)((filter >> 1) & 127));
++                int v4 = addclip20(reg1, mult4 >> 6, (mult4 >> 5) & 1); // 14
++                int v5 = addclip20(v4, mult5 >> 13, (mult5 >> 12) & 1); // 15
++
++                ram1[1] = (uint32_t)v5;
++            }
++            else
++            {
++                // hack: use 32-bit math to avoid overflow
++                int mult1 = reg1 * (int8_t)(filter >> 8); // 8
++                int mult2 = reg1 * (int8_t)((filter >> 1) & 127); // 9
++                int mult3 = reg1 * (int8_t)reg2_6; // 10
++
++                int v2 = reg3 + (mult1 >> 6) + ((mult1 >> 5) & 1); // 9
++                int v1 = v2 + (mult2 >> 13) + ((mult2 >> 12) & 1); // 10
++                int subvar = v1 + (mult3 >> 6) + ((mult3 >> 5) & 1); // 11
++
++                ram1[3] = (uint32_t)v1;
++
++                int tests = test;
++                tests <<= 12;
++                tests >>= 12;
++
++                v3 = tests - subvar; // 12
++
++                int mult4 = v3 * (int8_t)(filter >> 8);
++                int mult5 = v3 * (int8_t)((filter >> 1) & 127);
++                int v4 = reg1 + (mult4 >> 6) + ((mult4 >> 5) & 1); // 14
++                int v5 = v4 + (mult5 >> 13) + ((mult5 >> 12) & 1); // 15
++
++                ram1[1] = (uint32_t)v5;
++            }
++
++
++            ram1[5] = (uint32_t)reference;
++
++            if (active && (ram2[6] & 1) != 0 && (ram2[8] & 0x4000) == 0 && !pcm.irq_assert && irq_flag)
++            {
++                //fprintf(stderr, "irq voice %i\n", slot);
++                if (pcm.nfs)
++                    ram2[8] |= 0x4000;
++                pcm.irq_assert = true;
++                pcm.irq_channel = (uint8_t)slot;
++                if (pcm.mcu->is_jv880)
++                    MCU_GA_SetGAInt(*pcm.mcu, 5, 1);
++                else
++                    // Skeletal JV880 shape: the assert goes DIRECT,
++                    // as Sterr1 sets its GA line from the PCM core.
++                    // (The old FIFO split's PushIrq branch is deleted
++                    // with the FIFO itself.) The assert-set (core 3,
++                    // under the state lock during a batch) and the
++                    // status-read ACK clear (core 2, under the state
++                    // lock) are serialized by the lock;
++                    // Interrupt_Handle only reads interrupt_pending,
++                    // so no unlocked RMW races the locked writers.
++                    // No double delivery: the IRQ FIFO no longer
++                    // exists, so this is the only delivery path.
++                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++            }
++
++            int volmul1 = 0;
++            int volmul2 = 0;
++
++            calc_tv(pcm, 0, ram2[3], &ram2[9], active, &volmul1);
++            calc_tv(pcm, 1, ram2[4], &ram2[10], active, &volmul2);
++            calc_tv(pcm, 2, ram2[5], &ram2[11], active, NULL);
++
++            // if (volmul1 && volmul2)
++            //     volmul1 += 0;
++
++            int sample = (ram2[6] & 2) == 0 ? (int)ram1[3] : v3;
++            //sample = test;
++
++            int pan = active ? ram2[1] : 0;
++            int rc = active ? ram2[2] : 0;
++
++#if defined(NEON_MIX_TAIL_V2)
++            // NEON mix-tail v2 (opt-round2-20261031): single asm block for
++            // the whole mix-tail multi chain, NO lane inserts. Coefficient
++            // vectors are built by scalar C code into a 16-byte-aligned
++            // stack array and loaded with full-width LDR Q (vol pair in
++            // q1 low/high halves, pan/rc pair in q2). Multiplicands are
++            // DUP'd full-width (.4s). The serial addclip20 chain (incl.
++            // the cin rounding bit) runs as scalar instructions INSIDE
++            // the block so no intermediate crosses the block boundary;
++            // only sampl/sampr/rc0raw/rc1raw leave via UMOV (the
++            // unavoidable scalar interface to the sum chain, which stays
++            // serial and in order). multi() = sx20(a)*b with int32 wrap
++            // maps to SHL/SSHR #12 + MUL low 32 bits; sx20(x>>k) maps
++            // to SBFX (exact bit-field sign extend). Serial accumulation
++            // into ram1[31]/rcsum untouched.
++            int sampl = 0, sampr = 0, rc0raw = 0, rc1raw = 0;
++            uint64_t neon_pack[4] __attribute__((aligned(16)));
++            neon_pack[0] = (uint32_t)(int8_t)(volmul1 >> 8) |
++                           ((uint64_t)(uint32_t)(int8_t)((volmul1 >> 1) & 127) << 32);
++            neon_pack[1] = (uint32_t)(int8_t)(volmul2 >> 8) |
++                           ((uint64_t)(uint32_t)(int8_t)((volmul2 >> 1) & 127) << 32);
++            neon_pack[2] = (uint32_t)(int8_t)((pan >> 8) & 255) |
++                           ((uint64_t)(uint32_t)(int8_t)((pan >> 0) & 255) << 32);
++            neon_pack[3] = (uint32_t)(int8_t)((rc >> 8) & 255) |
++                           ((uint64_t)(uint32_t)(int8_t)((rc >> 0) & 255) << 32);
++            __asm__ volatile (
++                "ldr q1, [%[pack]]\n\t"
++                "ldr q2, [%[pack], #16]\n\t"
++                // vol1: sx20(sample) * [cA, cB] (lanes 0,1 of q1)
++                "dup v0.4s, %w[sample]\n\t"
++                "shl v0.4s, v0.4s, #12\n\t"
++                "sshr v0.4s, v0.4s, #12\n\t"
++                "mul v0.4s, v0.4s, v1.4s\n\t"
++                "umov w10, v0.s[0]\n\t"
++                "umov w11, v0.s[1]\n\t"
++                // sample2 = sx20(m1>>6) + sx20(m2>>13) + cin
++                "asr w14, w11, #12\n\t"
++                "asr w15, w10, #5\n\t"
++                "orr w14, w14, w15\n\t"
++                "and w14, w14, #1\n\t"
++                "sbfx w15, w10, #6, #20\n\t"
++                "sbfx w16, w11, #13, #19\n\t"
++                "add w17, w15, w16\n\t"
++                "add w17, w17, w14\n\t"
++                // vol2: sx20(sample2) * [cC, cD] (lanes 2,3 of q1)
++                "dup v0.4s, w17\n\t"
++                "shl v0.4s, v0.4s, #12\n\t"
++                "sshr v0.4s, v0.4s, #12\n\t"
++                "mul v0.4s, v0.4s, v1.4s\n\t"
++                "umov w12, v0.s[2]\n\t"
++                "umov w13, v0.s[3]\n\t"
++                // sample3
++                "asr w14, w13, #12\n\t"
++                "asr w15, w12, #5\n\t"
++                "orr w14, w14, w15\n\t"
++                "and w14, w14, #1\n\t"
++                "sbfx w15, w12, #6, #20\n\t"
++                "sbfx w16, w13, #13, #19\n\t"
++                "add w18, w15, w16\n\t"
++                "add w18, w18, w14\n\t"
++                // pan/rc: sx20(sample3) * [panHi, panLo, rcHi, rcLo]
++                "dup v0.4s, w18\n\t"
++                "shl v0.4s, v0.4s, #12\n\t"
++                "sshr v0.4s, v0.4s, #12\n\t"
++                "mul v0.4s, v0.4s, v2.4s\n\t"
++                "umov %w[sampl], v0.s[0]\n\t"
++                "umov %w[sampr], v0.s[1]\n\t"
++                "umov %w[rc0raw], v0.s[2]\n\t"
++                "umov %w[rc1raw], v0.s[3]\n\t"
++                : [sampl] "=r" (sampl), [sampr] "=r" (sampr),
++                  [rc0raw] "=r" (rc0raw), [rc1raw] "=r" (rc1raw)
++                : [sample] "r" (sample), [pack] "r" (neon_pack)
++                : "x10", "x11", "x12", "x13", "x14", "x15", "x16",
++                  "x17", "x18", "v0", "v1", "v2", "memory");
++            int rc0 = rc0raw >> 5; // reverb
++            int rc1 = rc1raw >> 5; // chorus
++#else
++            int multiv1 = multi(sample, (int8_t)(volmul1 >> 8));
++            int multiv2 = multi(sample, (int8_t)((volmul1 >> 1) & 127));
++
++            int sample2 = addclip20(multiv1 >> 6, multiv2 >> 13, ((multiv2 >> 12) | (multiv1 >> 5)) & 1);
++
++            int multiv3 = multi(sample2, (int8_t)(volmul2 >> 8));
++            int multiv4 = multi(sample2, (int8_t)((volmul2 >> 1) & 127));
++
++            int sample3 = addclip20(multiv3 >> 6, multiv4 >> 13, ((multiv4 >> 12) | (multiv3 >> 5)) & 1);
++
++            int sampl = multi(sample3, (int8_t)((pan >> 8) & 255));
++            int sampr = multi(sample3, (int8_t)((pan >> 0) & 255));
++
++            int rc0 = multi(sample3, (int8_t)((rc >> 8) & 255)) >> 5; // reverb
++            int rc1 = multi(sample3, (int8_t)((rc >> 0) & 255)) >> 5; // chorus
++#endif
++            
++            // Split accumulation: this slot's mix terms plus its slot2
++            // injection terms (same mapping as the original two switches,
++            // merged into one) go to the even/odd accumulator pair.
++            // The running-sum sx20 wrap is deferred to the combine
++            // below; by the sx20 homomorphism the combined value is
++            // congruent mod 2^20 to the original serial sum, and every
++            // downstream observation (sx20 reads, write_mask low bits)
++            // is therefore identical.
++            int32_t tL = sx20(sampl >> 6) + ((sampl >> 5) & 1);
++            int32_t tR = sx20(sampr >> 6) + ((sampr >> 5) & 1);
++            int32_t tC0 = sx20(rc0 >> 1) + (rc0 & 1);
++            int32_t tC1 = sx20(rc1 >> 1) + (rc1 & 1);
++            int slot2 = (slot == pcm.config.reg_slots - 1) ? 31 : slot + 1;
++            switch (slot2)
++            {
++                // 17, 18 - reverb
++                case 17:
++                    tL += sx20(rcadd[0] >> 1) + (rcadd[0] & 1);
++                    tC1 += sx20(rcadd2[0] >> 1) + (rcadd2[0] & 1);
++                    break;
++                case 18:
++                    tR += sx20(rcadd[1] >> 1) + (rcadd[1] & 1);
++                    tC1 += sx20(rcadd2[1] >> 1) + (rcadd2[1] & 1);
++                    break;
++                case 21:
++                    tL += sx20(rcadd[2] >> 1) + (rcadd[2] & 1);
++                    tC0 += sx20(rcadd2[2] >> 1) + (rcadd2[2] & 1);
++                    break;
++                case 22:
++                    tR += sx20(rcadd[3] >> 1) + (rcadd[3] & 1);
++                    tC1 += sx20(rcadd2[3] >> 1) + (rcadd2[3] & 1);
++                    break;
++                case 23:
++                    tL += sx20(rcadd[4] >> 1) + (rcadd[4] & 1);
++                    tC0 += sx20(rcadd2[4] >> 1) + (rcadd2[4] & 1);
++                    break;
++                case 31:
++                    tR += sx20(rcadd[5] >> 1) + (rcadd[5] & 1);
++                    tC1 += sx20(rcadd2[5] >> 1) + (rcadd2[5] & 1);
++                    break;
++            }
++            // Single predictable branch (alternating parity) for all
++            // four accumulators; keeps them in registers, no bus
++            // load/store per slot, no 32-deep serial chain.
++            if (slot & 1)
++            {
++                accL1 += tL;
++                accR1 += tR;
++                accC01 += tC0;
++                accC11 += tC1;
++            }
++            else
++            {
++                accL0 += tL;
++                accR0 += tR;
++                accC00 += tC0;
++                accC10 += tC1;
++            }
++
++            if (key && pcm.nfs)
++            {
++                ram2[7] &= ~0xf020;
++                ram2[7] |= (uint16_t)(((usenew || kon) ? newnibble : old_nibble) << 12);
++
++                // update key
++                ram2[7] |= (uint16_t)(key << 5);
++            }
++
++            if (!active)
++            {
++                if (pcm.nfs)
++                {
++                    ram1[1] = 0;
++                    ram1[3] = 0;
++                    ram1[5] = 0;
++                }
++
++                ram2[8] = 0;
++                ram2[9] = 0;
++                ram2[10] = 0;
++            }
++        }
++
++        // Combine: exact partial sums -> accum/rcsum. Congruent mod
++        // 2^20 to the original serial sums (sx20 homomorphism), so all
++        // downstream observations are identical. ram1[31][1]/[3] are
++        // intentionally left at their pre-loop zero: the bus value is
++        // unobserved after the tick (zeroed pre-loop next tick; the
++        // only in-tick reader was the replaced accumulation) and the
++        // state hash excludes pcm_t.
++        pcm.accum_l = accL0 + accL1;
++        pcm.accum_r = accR0 + accR1;
++        pcm.rcsum[0] = accC00 + accC01;
++        pcm.rcsum[1] = accC10 + accC11;
++        // PMU (shaped-var): voice-mix cycles for this batch,
++        // accumulated PER BATCH (not per tick) to keep read overhead
++        // negligible. NOP-corrected, clamped at 0.
++        if (g_splitT)
++        {
++            const uint64_t nMixDelta = PMU_ReadCycles() - nMixStartCyc;
++            const uint64_t nMixNop = g_splitT->nop_cyc3;
++            g_splitT->mix_cyc = g_splitT->mix_cyc + (nMixDelta >= nMixNop ? nMixDelta - nMixNop : 0);
++        }
++
++        if (pcm.nfs)
++        {
++            pcm.ram2[31][7] |= 0x20;
++        }
++
++        pcm.nfs = true;
++
++        uint64_t new_cycles = (uint64_t)(pcm.config.reg_slots + 1) * 25;
++
++        pcm.cycles += pcm.mcu->is_jv880 ? (new_cycles * 25) / 29 : new_cycles;
++
++        // mt32-pi dual-core split: publish the RenderStep of the tick
++        // that just advanced, so the MCU thread's tick rule can tell
++        // which ticks have rendered. No-op when inactive / JV880.
++        // The advance passed is the actual cycles advanced (JV880
++        // scales it), mirroring the prototype.
++        if (g_splitT)
++            g_splitT->PublishRenderedStep(pcm, pcm.mcu->is_jv880 ? (new_cycles * 25) / 29 : new_cycles);
++    }
++
++    if (nProfileStart)
++    {
++        NukedProfile().nPCMUs += pProfileClock() - nProfileStart;
++        ++NukedProfile().nPCMUpdates;
++    }
++}
++#undef NEON_MIX_TAIL_V2
++
++void PCM_Update_Layout(pcm_t& pcm, uint64_t cycles)
++{
++    // mt32-pi profiling: only calls that will render at least one tick
++    // take clock readings, so the common no-op call costs one comparison.
++    const NukedProfileClockFn pProfileClock = NukedProfileClock();
++    const uint64_t nProfileStart = (pProfileClock && pcm.cycles < cycles) ? pProfileClock() : 0;
++
++    while (pcm.cycles < cycles)
++    {
++        // mt32-pi dual-core split: apply the register writes (and IRQ-ACK
++        // clears) due before this tick, in step order. No-op when the
++        // split is inactive (g_splitT null) or for JV880 (bypassed).
++        if (g_splitT)
++            g_splitT->DrainBeforeTick(pcm);
++
++        const uint32_t voice_active = pcm.voice_mask & pcm.voice_mask_pending;
++        { // final mixing
++            int shifter = pcm.ram2[30][10];
++            int xr = ((shifter >> 0) ^ (shifter >> 1) ^ (shifter >> 7) ^ (shifter >> 12)) & 1;
++            shifter = (shifter >> 1) | (xr << 15);
++            pcm.ram2[30][10] = (uint16_t)shifter;
++
++            pcm.accum_l = addclip20(pcm.accum_l, (int32_t)pcm.ram1[30][0], 0);
++            pcm.accum_r = addclip20(pcm.accum_r, (int32_t)pcm.ram1[30][1], 0);
++
++            pcm.ram1[30][2] = (uint32_t)addclip20(pcm.accum_l,
++                (int32_t)(pcm.config.orval | (shifter & pcm.config.noise_mask)), 0);
++
++            pcm.ram1[30][4] = (uint32_t)addclip20(pcm.accum_r,
++                (int32_t)(pcm.config.orval | (shifter & pcm.config.noise_mask)), 0);
++
++            pcm.ram1[30][0] = (uint32_t)(pcm.accum_l & pcm.config.write_mask);
++            pcm.ram1[30][1] = (uint32_t)(pcm.accum_r & pcm.config.write_mask);
++            
++
++            int32_t samp_l = (int32_t)((pcm.ram1[30][2] & (uint32_t)(~pcm.config.write_mask)) << 12);
++            int32_t samp_r = (int32_t)((pcm.ram1[30][4] & (uint32_t)(~pcm.config.write_mask)) << 12);
++
++            MCU_PostSample(*pcm.mcu, {samp_l, samp_r});
++
++            xr = ((shifter >> 0) ^ (shifter >> 1) ^ (shifter >> 7) ^ (shifter >> 12)) & 1;
++            shifter = (shifter >> 1) | (xr << 15);
++
++            pcm.accum_l = addclip20(pcm.accum_l, (int32_t)pcm.ram1[30][0], 0);
++            pcm.accum_r = addclip20(pcm.accum_r, (int32_t)pcm.ram1[30][1], 0);
++
++            pcm.ram1[30][3] = (uint32_t)addclip20(pcm.accum_l,
++                (int32_t)(pcm.config.orval | (shifter & pcm.config.noise_mask)), 0);
++
++            pcm.ram1[30][5] = (uint32_t)addclip20(pcm.accum_r,
++                (int32_t)(pcm.config.orval | (shifter & pcm.config.noise_mask)), 0);
++
++            if (pcm.enable_oversampling && pcm.config.oversampling) // oversampling
++            {
++                pcm.ram2[30][10] = (uint16_t)shifter;
++
++                pcm.ram1[30][0] = (uint32_t)(pcm.accum_l & pcm.config.write_mask);
++                pcm.ram1[30][1] = (uint32_t)(pcm.accum_r & pcm.config.write_mask);
++
++
++                samp_l = (int32_t)((pcm.ram1[30][3] & (uint32_t)(~pcm.config.write_mask)) << 12);
++                samp_r = (int32_t)((pcm.ram1[30][5] & (uint32_t)(~pcm.config.write_mask)) << 12);
++
++                MCU_PostSample(*pcm.mcu, {samp_l, samp_r});
++            }
++        }
++
++        { // global counter for envelopes
++            if (!pcm.nfs)
++                pcm.tv_counter = pcm.ram2[31][8]; // fixme
++
++            pcm.tv_counter -= 1;
++
++            pcm.tv_counter &= 0x3fff;
++        }
++
++        // chorus/reverb
++
++        { // fixme
++            if (pcm.ram2[31][8] & 0x8000)
++                pcm.ram2[31][9] = pcm.ram2[31][8] & 0x7fff;
++            else
++                pcm.ram2[31][10] = pcm.ram2[31][8] & 0x7fff;
++
++            if ((0x4000 - pcm.ram2[31][8]) & 0x8000)
++                pcm.ram2[31][10] = (0x4000 - pcm.ram2[31][8]) & 0x7fff;
++            else
++                pcm.ram2[31][9] = (0x4000 - pcm.ram2[31][8]) & 0x7fff;
++        }
++
++        {
++            int v1 = pcm.ram2[31][1];
++
++            int m1 = multi((int32_t)pcm.ram1[29][1], (int8_t)(v1 >> 8)) >> 5; // 14
++            int m2 = multi(pcm.rcsum[1], (int8_t)(v1 & 255)) >> 5; // 15
++
++            pcm.ram1[29][1] = (uint32_t)addclip20(m1 >> 1, m2 >> 1, (m1 | m2) & 1); // 16
++        }
++
++        {
++            const bool okey = (pcm.ram2[31][7] & 0x20) != 0;
++            const bool key = 1;
++            const bool active = okey && key;
++            int u = 0;
++            calc_tv(pcm, 1, pcm.ram2[30][0], &pcm.ram2[30][9], active, &u);
++        }
++
++        {
++            int v1 = pcm.ram2[30][1];
++            int m1 = multi((int32_t)pcm.ram1[29][0], (int8_t)(v1 >> 8)) >> 5; // 17
++            int m2 = multi(pcm.rcsum[0], (int8_t)(v1 & 255)) >> 5; // 18
++
++            pcm.ram1[29][0] = (uint32_t)addclip20(m1 >> 1, m2 >> 1, (m1 | m2) & 1); // 19
++        }
++
++        int rcadd[6] = {};
++        int rcadd2[6] = {};
++
++        {
++            {
++                // 1
++                int v1 = pcm.ram2[30][4];
++                int m1 = multi((int32_t)pcm.ram1[29][0], (int8_t)(v1 >> 8)) >> 6;
++                int v2 = 0;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][1] + pcm.tv_counter, 1);
++                int s2 = eram_unpack(pcm, pcm.ram2[28][1] + pcm.tv_counter);
++                if ((v1 & 0x30) != 0)
++                {
++                    v2 = s1;
++                }
++                int v3 = addclip20(m1, v2 ^ 0xfffff, 1);
++                pcm.ram1[29][4] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[29][5] = (uint32_t)addclip20(m2 >> 1, s2, m2 & 1);
++            }
++            {
++                // 2
++                int v1 = pcm.ram2[30][4];
++                int v2 = 0;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][2] + pcm.tv_counter, 1);
++                int s2 = eram_unpack(pcm, pcm.ram2[28][2] + pcm.tv_counter);
++                if ((v1 & 0x30) != 0)
++                {
++                    v2 = s1;
++                }
++                int v3 = addclip20((int32_t)pcm.ram1[29][5], v2 ^ 0xfffff, 1);
++                pcm.ram1[29][5] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][0] = (uint32_t)addclip20(m2 >> 1, s2, m2 & 1);
++            }
++            {
++                // 3
++                int v1 = pcm.ram2[30][4];
++                int v2 = 0;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][3] + pcm.tv_counter, 1);
++                int s2 = eram_unpack(pcm, pcm.ram2[28][3] + pcm.tv_counter);
++                if ((v1 & 0x30) != 0)
++                {
++                    v2 = s1;
++                }
++                int v3 = addclip20((int32_t)pcm.ram1[28][0], v2 ^ 0xfffff, 1);
++                pcm.ram1[28][0] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][1] = (uint32_t)addclip20(m2 >> 1, s2, m2 & 1);
++
++
++                pcm.ram1[28][2] = (uint32_t)eram_unpack(pcm, pcm.ram2[28][5] + pcm.tv_counter);
++            }
++            {
++                // 4
++                int v1 = pcm.ram2[30][5];
++                int v2 = 0;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][4] + pcm.tv_counter, 1);
++                int s2 = eram_unpack(pcm, pcm.ram2[28][4] + pcm.tv_counter);
++                if ((v1 & 0x30) != 0)
++                {
++                    v2 = s1;
++                }
++                int v3 = addclip20((int32_t)pcm.ram1[28][1], v2 ^ 0xfffff, 1);
++                pcm.ram1[28][1] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][3] = (uint32_t)addclip20(m2 >> 1, s2, m2 & 1);
++
++
++                pcm.ram1[28][4] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][1] + pcm.tv_counter);
++            }
++            {
++                // 5
++
++                int v1 = pcm.ram2[30][7];
++                int m1 = multi((int32_t)pcm.ram1[29][2], (int8_t)(v1 >> 8)) >> 5;
++                int s1 = eram_unpack(pcm, pcm.ram2[29][0] + pcm.tv_counter);
++                int m2 = multi(s1, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[29][2] = (uint32_t)addclip20(m1 >> 1, m2 >> 1, (m1 | m2) & 1);
++
++                eram_pack(pcm, pcm.ram2[28][0] + pcm.tv_counter, pcm.ram1[29][4]);
++            }
++            {
++                // 6
++
++                int v1 = pcm.ram2[30][8];
++                int m1 = multi((int32_t)pcm.ram1[29][3], (int8_t)(v1 >> 8)) >> 5;
++                int s1 = eram_unpack(pcm, pcm.ram2[29][8] + pcm.tv_counter);
++                int m2 = multi(s1, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[29][3] = (uint32_t)addclip20(m1 >> 1, m2 >> 1, (m1 | m2) & 1);
++
++                eram_pack(pcm, pcm.ram2[28][1] + pcm.tv_counter, pcm.ram1[29][5]);
++
++                eram_pack(pcm, pcm.ram2[28][2] + pcm.tv_counter, pcm.ram1[28][0]);
++            }
++            {
++                // 7
++
++                int v1 = pcm.ram2[30][9];
++                int v2 = (int)pcm.ram1[28][3];
++                int m1 = multi((int32_t)pcm.ram1[29][2], (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi((int32_t)pcm.ram1[29][3], (int8_t)(v1 >> 8)) >> 5;
++                pcm.ram1[28][3] = (uint32_t)addclip20(v2, m1 >> 1, m1 & 1);
++                pcm.ram1[28][5] = (uint32_t)addclip20(v2, m2 >> 1, m2 & 1);
++
++                eram_pack(pcm, pcm.ram2[28][3] + pcm.tv_counter, pcm.ram1[28][1]);
++            }
++            {
++                // 8
++
++                int v1 = pcm.ram2[30][6];
++                int m1 = multi((int32_t)pcm.ram1[28][2], (int8_t)(v1 >> 8)) >> 5;
++
++                int v2 = addclip20((int32_t)pcm.ram1[28][3], m1 >> 1, m1 & 1);
++                pcm.ram1[28][3] = (uint32_t)v2;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][2] = (uint32_t)addclip20((int32_t)pcm.ram1[28][2], m2 >> 1, m2 & 1);
++
++
++                pcm.ram1[28][1] = (uint32_t)eram_unpack(pcm, pcm.ram2[28][9] + pcm.tv_counter);
++            }
++            {
++                // 9
++
++                int v1 = pcm.ram2[30][6];
++                int m1 = multi((int32_t)pcm.ram1[28][4], (int8_t)(v1 >> 8)) >> 5;
++
++                int v2 = addclip20((int32_t)pcm.ram1[28][5], m1 >> 1, m1 & 1);
++                pcm.ram1[28][5] = (uint32_t)v2;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][4] = (uint32_t)addclip20((int32_t)pcm.ram1[28][4], m2 >> 1, m2 & 1);
++
++
++                pcm.ram1[29][4] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][5] + pcm.tv_counter);
++            }
++            {
++                // 10
++
++                int v1 = pcm.ram2[30][6];
++                int v2 = (int)pcm.ram1[28][1];
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int s1 = eram_unpack(pcm, pcm.ram2[28][8] + pcm.tv_counter);
++                int v3 = addclip20(m1 >> 1, s1, m1 & 1);
++                pcm.ram1[28][1] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[29][5] = (uint32_t)addclip20(m2 >> 1, v2, m2 & 1);
++
++                eram_pack(pcm, pcm.ram2[28][4] + pcm.tv_counter, pcm.ram1[28][3]);
++            }
++            {
++                // 11
++
++                int v1 = pcm.ram2[30][6];
++                int v2 = (int)pcm.ram1[29][4];
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int s1 = eram_unpack(pcm, pcm.ram2[29][4] + pcm.tv_counter);
++                int v3 = addclip20(m1 >> 1, s1, m1 & 1);
++                pcm.ram1[29][4] = (uint32_t)v3;
++                int m2 = multi(v3, (int8_t)(v1 & 255)) >> 5;
++                pcm.ram1[28][0] = (uint32_t)addclip20(m2 >> 1, v2, m2 & 1);
++
++
++                eram_pack(pcm, pcm.ram2[28][5] + pcm.tv_counter, pcm.ram1[28][2]);
++
++                eram_pack(pcm, pcm.ram2[29][0] + pcm.tv_counter, pcm.ram1[28][5]);
++            }
++            {
++                // 12
++
++                pcm.ram1[28][5] = (uint32_t)eram_unpack(pcm, pcm.ram2[28][6] + pcm.tv_counter);
++            }
++
++            {
++                // 13
++
++                int s1 = eram_unpack(pcm, pcm.ram2[28][10] + pcm.tv_counter);
++                pcm.ram1[28][5] = (uint32_t)addclip20((int32_t)pcm.ram1[28][5], s1, 0);
++
++                pcm.ram1[28][2] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][2] + pcm.tv_counter);
++            }
++
++            {
++                // 14
++
++                int s1 = eram_unpack(pcm, pcm.ram2[29][6] + pcm.tv_counter);
++                int t1 = addclip20(s1, (int32_t)pcm.ram1[28][2], 0); // 6
++
++                pcm.ram1[28][5] = (uint32_t)addclip20(t1, (int32_t)pcm.ram1[28][5], 0);
++
++                pcm.ram1[28][2] = (uint32_t)eram_unpack(pcm, pcm.ram2[28][7] + pcm.tv_counter);
++            }
++
++            {
++                // 15
++
++                int s1 = eram_unpack(pcm, pcm.ram2[28][11] + pcm.tv_counter);
++                pcm.ram1[28][2] = (uint32_t)addclip20((int32_t)pcm.ram1[28][2], s1, 0);
++
++                pcm.ram1[28][3] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][3] + pcm.tv_counter);
++            }
++
++            {
++                // 16
++
++                int s1 = eram_unpack(pcm, pcm.ram2[29][7] + pcm.tv_counter);
++                int t1 = addclip20(s1, (int32_t)pcm.ram1[28][2], 0);
++                pcm.ram1[28][2] = (uint32_t)addclip20(t1, (int32_t)pcm.ram1[28][3], 0);
++
++
++                eram_pack(pcm, pcm.ram2[29][1] + pcm.tv_counter, pcm.ram1[28][4]);
++
++                eram_pack(pcm, pcm.ram2[28][8] + pcm.tv_counter, pcm.ram1[28][1]);
++            }
++
++            {
++                // 17
++                int v1 = pcm.ram2[30][2];
++                int v2 = (int)pcm.ram1[28][5];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++
++                rcadd[0] = m1;
++
++                rcadd2[0] = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                int t1 = eram_unpack(pcm, pcm.ram2[29][10] + pcm.tv_counter + 1); //? 3a6e
++                eram_pack(pcm, pcm.ram2[28][9] + pcm.tv_counter, pcm.ram1[29][5]);
++                pcm.ram1[29][5] = (uint32_t)t1;
++            }
++
++            {
++                // 18
++                int v1 = pcm.ram2[30][3];
++                int v2 = (int)pcm.ram1[28][2];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++
++                rcadd[1] = m1;
++
++                rcadd2[1] = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                pcm.ram1[28][1] = (uint32_t)eram_unpack(pcm, pcm.ram2[29][11] + pcm.tv_counter + 1); //? 3a1e
++            }
++            {
++                // 19
++
++                int v1 = pcm.ram2[31][9];
++
++                int s1 = eram_unpack(pcm, pcm.ram2[29][10] + pcm.tv_counter); //? 3a6d
++
++                eram_pack(pcm, pcm.ram2[29][4] + pcm.tv_counter, pcm.ram1[29][4]);
++
++                int m1 = multi(s1, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi((int32_t)pcm.ram1[29][5], (int8_t)(v1 >> 8)) >> 5;
++
++                int t2 = addclip20(s1, (m1 >> 1) ^ 0xfffff, 1);
++
++                pcm.ram1[29][5] = (uint32_t)addclip20(t2, m2 >> 1, m2 & 1);
++            }
++            {
++                // 20
++
++                int v1 = pcm.ram2[31][10];
++
++                int s1 = eram_unpack(pcm, pcm.ram2[29][11] + pcm.tv_counter); //? 3a1d
++
++                eram_pack(pcm, pcm.ram2[29][5] + pcm.tv_counter, pcm.ram1[28][0]);
++
++                int m1 = multi(s1, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi((int32_t)pcm.ram1[28][1], (int8_t)(v1 >> 8)) >> 5;
++
++                int t2 = addclip20(s1, (m1 >> 1) ^ 0xfffff, 1);
++
++                pcm.ram1[28][1] = (uint32_t)addclip20(t2, m2 >> 1, m2 & 1);
++
++                eram_pack(pcm, pcm.ram2[29][9] + pcm.tv_counter, pcm.ram1[29][1]);
++            }
++            {
++                // 21
++
++                int v1 = pcm.ram2[31][2];
++                int v2 = (int)pcm.ram1[29][5];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                rcadd[2] = m1;
++                rcadd2[2] = m2;
++            }
++            {
++                // 22
++
++                int v1 = pcm.ram2[31][3];
++                int v2 = (int)pcm.ram1[29][5];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                rcadd[3] = m1;
++                rcadd2[3] = m2;
++            }
++            {
++                // 23
++
++                int v1 = pcm.ram2[31][4];
++                int v2 = (int)pcm.ram1[28][1];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                rcadd[4] = m1;
++                rcadd2[4] = m2;
++            }
++            {
++                // 31
++
++                int v1 = pcm.ram2[31][5];
++                int v2 = (int)pcm.ram1[28][1];
++
++                int m1 = multi(v2, (int8_t)(v1 >> 8)) >> 5;
++                int m2 = multi(v2, (int8_t)(v1 & 255)) >> 5;
++
++                rcadd[5] = m1;
++                rcadd2[5] = m2;
++
++                {
++                    // address generator
++
++                    const bool key = 1;
++                    const bool okey = (pcm.ram2[31][7] & 0x20) != 0;
++                    const bool active = key && okey;
++                    const bool kon = key && !okey;
++
++                    bool b15 = (pcm.ram2[31][8] & 0x8000) != 0; // 0
++                    const bool b6 = (pcm.ram2[31][7] & 0x40) != 0; // 1
++                    const bool b7 = (pcm.ram2[31][7] & 0x80) != 0; // 1
++                    int old_nibble = (pcm.ram2[31][7] >> 12) & 15; // 1
++                    (void)old_nibble; // unused
++
++                    int address = (int)pcm.ram1[31][4]; // 0
++                    int address_end = (int)pcm.ram1[31][0]; // 1 or 2
++                    int address_loop = (int)pcm.ram1[31][2]; // 2 or 1
++
++                    int sub_phase = (pcm.ram2[31][8] & 0x3fff); // 1
++                    int interp_ratio = (sub_phase >> 7) & 127;
++                    (void)interp_ratio; // unused
++                    sub_phase += pcm.ram2[pcm.ram2[31][7] & 31][0]; // 5
++                    int sub_phase_of = (sub_phase >> 14) & 7;
++                    if (pcm.nfs)
++                    {
++                        pcm.ram2[31][8] &= ~0x3fff;
++                        pcm.ram2[31][8] |= sub_phase & 0x3fff;
++                    }
++
++
++                    // address 0
++                    int address_cnt = address;
++
++                    int cmp1 = b15 ? address_loop : address_end;
++                    int cmp2 = address_cnt;
++                    bool address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 9
++                    bool next_b15 = b15;
++
++                    int next_address = address_cnt; // 11
++
++                    cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++                    cmp2 = address_cnt;
++                    int address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++                    const bool address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++                    const bool address_sub = !address_cmp && b6 && b15;
++                    if (b7)
++                        address_cnt2 -= address_add - address_sub;
++                    else
++                        address_cnt2 += address_add - address_sub;
++                    address_cnt = address_cnt2 & 0xfffff; // 11
++                    b15 = b6 && (b15 ^ address_cmp); // 11
++
++                    cmp1 = b15 ? address_loop : address_end;
++                    cmp2 = address_cnt;
++                    address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 13
++
++                    if (sub_phase_of >= 1)
++                    {
++                        next_address = address_cnt; // 13
++                        next_b15 = b15;
++                    }
++
++                    if (active && pcm.nfs)
++                        pcm.ram1[31][4] = (uint32_t)next_address;
++
++                    if (pcm.nfs)
++                    {
++                        pcm.ram2[31][8] &= ~0x8000;
++                        pcm.ram2[31][8] |= (uint16_t)(next_b15 << 15);
++                    }
++
++                    int t1 = address_loop; // 18
++                    int t2 = (int)pcm.ram1[31][4] - t1; // 19
++                    int t3 = address_end - t2; // 20
++                    int t4 = (int)pcm.ram1[31][4]; // 23
++
++                    pcm.ram2[29][10] = (uint16_t)t3;
++                    pcm.ram2[29][11] = (uint16_t)t4;
++                }
++            }
++        }
++
++        pcm.ram1[31][1] = 0;
++        pcm.ram1[31][3] = 0;
++        pcm.rcsum[0] = 0;
++        pcm.rcsum[1] = 0;
++
++        // Cross-slot mix inputs, filled by the scalar tail below and
++        // consumed by the vector pass after the loop. Zero-initialized
++        // so lanes beyond reg_slots contribute zero terms. 16-byte
++        // aligned for full-width vector loads. reg_slots <= 32 always
++        // (ram1/ram2 are [32][...]), so [32] is exact, not a guess.
++        int32_t mix_sample[32] __attribute__((aligned(16))) = {};
++        int32_t mix_vm1[32] __attribute__((aligned(16))) = {};
++        int32_t mix_vm2[32] __attribute__((aligned(16))) = {};
++        int32_t mix_pan[32] __attribute__((aligned(16))) = {};
++        int32_t mix_rc[32] __attribute__((aligned(16))) = {};
++        int32_t mix_injL[32] __attribute__((aligned(16))) = {};
++        int32_t mix_injR[32] __attribute__((aligned(16))) = {};
++        int32_t mix_injC0[32] __attribute__((aligned(16))) = {};
++        int32_t mix_injC1[32] __attribute__((aligned(16))) = {};
++        // PMU (shaped-var): voice-mix start. The accumulation follows
++        // this construct (after its close, before the post-loop nfs
++        // block). Skipped when g_splitT is null: in single-threaded
++        // mode core 2 never calls the split batches, and the
++        // single-threaded PCM_Update call is not a core-3 batch.
++        const uint64_t nMixStartCyc = g_splitT ? PMU_ReadCycles() : 0;
++        for (int slot = 0; slot < pcm.config.reg_slots; slot++)
++        {
++            uint32_t *ram1 = pcm.ram1[slot];
++            uint16_t *ram2 = pcm.ram2[slot];
++            const bool okey = (ram2[7] & 0x20) != 0;
++            const bool key = (voice_active >> slot) & 1;
++
++            const bool active = okey && key;
++            const bool kon = key && !okey;
++
++            // address generator
++
++            bool b15 = (ram2[8] & 0x8000) != 0; // 0
++            const bool b6 = (ram2[7] & 0x40) != 0; // 1
++            const bool b7 = (ram2[7] & 0x80) != 0; // 1
++            int hiaddr = (ram2[7] >> 8) & 15; // 1
++            int old_nibble = (ram2[7] >> 12) & 15; // 1
++
++            int address = (int)ram1[4]; // 0
++            int address_end = (int)ram1[0]; // 1 or 2
++            int address_loop = (int)ram1[2]; // 2 or 1
++
++            int cmp1 = b15 ? address_loop : address_end;
++            int cmp2 = address;
++            const bool nibble_cmp1 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 2
++            bool irq_flag = 0;
++
++            // fixme:
++            if (kon)
++                irq_flag = ((cmp1 + address_loop) & 0x100000) != 0;
++            else
++                irq_flag = ((address + ((-address_loop) & 0xfffff)) & 0x100000) != 0;
++            irq_flag ^= b7;
++
++            int nibble_address = (!b6 && nibble_cmp1) ? address_loop : address; // 3
++            const bool address_b4 = (nibble_address & 0x10) != 0;
++            int wave_address = nibble_address >> 5;
++            const bool xor2 = (address_b4 ^ b7);
++            const bool check1 = xor2 && active;
++            const bool xor1 = (b15 ^ !nibble_cmp1);
++            const bool nibble_add = b6 ? check1 && xor1 : (!nibble_cmp1 && check1);
++            const bool nibble_subtract = b6 && !xor1 && active && !xor2;
++            if (b7)
++                wave_address -= nibble_add - nibble_subtract;
++            else
++                wave_address += nibble_add - nibble_subtract;
++            wave_address &= 0xfffff;
++
++            int newnibble = PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | wave_address));
++            const bool newnibble_sel = address_b4 ^ ((b6 || !nibble_cmp1) && okey);
++            if (newnibble_sel)
++                newnibble = (newnibble >> 4) & 15;
++            else
++                newnibble &= 15;
++
++            int sub_phase = (ram2[8] & 0x3fff); // 1
++            int interp_ratio = (sub_phase >> 7) & 127;
++            sub_phase += pcm.ram2[ram2[7] & 31][0]; // 5
++            int sub_phase_of = (sub_phase >> 14) & 7;
++            if (pcm.nfs)
++            {
++                ram2[8] &= ~0x3fff;
++                ram2[8] |= sub_phase & 0x3fff;
++            }
++
++
++            // address 0
++            int address_cnt = address;
++            int samp0 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 18
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp2 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 8
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            bool address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 9
++
++            int next_address = address_cnt; // 11
++            bool usenew = !nibble_cmp2;
++            bool next_b15 = b15;
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            int address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            bool address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            bool address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 11
++            b15 = b6 && (b15 ^ address_cmp); // 11
++
++            int samp1 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 20
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp3 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 12
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 13
++
++            if (sub_phase_of >= 1)
++            {
++                next_address = address_cnt; // 13
++                usenew = !nibble_cmp3;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 15
++            b15 = b6 && (b15 ^ address_cmp); // 15
++
++            int samp2 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 1
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp4 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 16
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 17
++
++            if (sub_phase_of >= 2)
++            {
++                next_address = address_cnt; // 17
++                usenew = !nibble_cmp4;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 19
++            b15 = b6 && (b15 ^ address_cmp); // 19
++
++            int samp3 = (int8_t)PCM_ReadROM(pcm, (uint32_t)((hiaddr << 20) | address_cnt)); // 5
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp5 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 20
++            cmp1 = b15 ? address_loop : address_end;
++            cmp2 = address_cnt;
++            address_cmp = (cmp1 & 0xfffff) == (cmp2 & 0xfffff); // 21
++
++            if (sub_phase_of >= 3)
++            {
++                next_address = address_cnt; // 21
++                usenew = !nibble_cmp5;
++                next_b15 = b15;
++            }
++
++            cmp1 = (!b6 && address_cmp) ? address_loop : address_cnt;
++            cmp2 = address_cnt;
++            address_cnt2 = (kon || (!b6 && address_cmp)) ? cmp1 : cmp2;
++
++            address_add = (!address_cmp && b6 && !b15) || (!address_cmp && !b6);
++            address_sub = !address_cmp && b6 && b15;
++            if (b7)
++                address_cnt2 -= address_add - address_sub;
++            else
++                address_cnt2 += address_add - address_sub;
++            address_cnt = address_cnt2 & 0xfffff; // 23
++            // b15 = b6 && (b15 ^ address_cmp); // 23
++
++            cmp1 = address;
++            cmp2 = address_cnt;
++            const bool nibble_cmp6 = (cmp1 & 0xffff0) == (cmp2 & 0xffff0); // 24
++
++            if (sub_phase_of >= 4)
++            {
++                next_address = address_cnt; // 1
++                usenew = !nibble_cmp6;
++                // b15 is not updated?
++            }
++
++            if (active && pcm.nfs)
++                ram1[4] = (uint32_t)next_address;
++
++            if (pcm.nfs)
++            {
++                ram2[8] &= ~0x8000;
++                ram2[8] |= (uint16_t)(next_b15 << 15);
++            }
++
++            // dpcm
++
++            // 18
++            int reference = (int)ram1[5];
++
++            // 19
++            int preshift = samp0 << 10;
++            int select_nibble = nibble_cmp2 ? old_nibble : newnibble;
++            int shift = (10 - select_nibble) & 15;
++
++            int shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 1)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp1 << 10;
++            select_nibble = nibble_cmp3 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 2)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp2 << 10;
++            select_nibble = nibble_cmp4 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 3)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            preshift = samp3 << 10;
++            select_nibble = nibble_cmp5 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++
++            shifted = (preshift << 1) >> shift;
++
++            if (sub_phase_of >= 4)
++                reference = addclip20(reference, shifted >> 1, shifted & 1);
++
++            // interpolation
++
++            int test = (int)ram1[5];
++
++            int step0 = multi(interp_lut[0][interp_ratio] << 6, (int8_t)samp0) >> 8;
++            select_nibble = nibble_cmp2 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step0 =  (step0 << 1) >> shift;
++
++            test = addclip20(test, step0 >> 1, step0 & 1);
++
++
++            int step1 = multi(interp_lut[1][interp_ratio] << 6, (int8_t)samp1) >> 8;
++            select_nibble = nibble_cmp3 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step1 = (step1 << 1) >> shift;
++
++            test = addclip20(test, step1 >> 1, step1 & 1);
++
++            int step2 = multi(interp_lut[2][interp_ratio] << 6, (int8_t)samp2) >> 8;
++            select_nibble = nibble_cmp4 ? old_nibble : newnibble;
++            shift = (10 - select_nibble) & 15;
++            step2 = (step2 << 1) >> shift;
++
++            int reg1 = (int)ram1[1];
++            int reg3 = (int)ram1[3];
++            int reg2_6 = (ram2[6] >> 8) & 127;
++
++            test = addclip20(test, step2 >> 1, step2 & 1);
++
++            int filter = ram2[11];
++            int v3;
++
++            if (pcm.mcu->is_mk1)
++            {
++                int mult1 = multi(reg1, (int8_t)(filter >> 8)); // 8
++                int mult2 = multi(reg1, (int8_t)((filter >> 1) & 127)); // 9
++                int mult3 = multi(reg1, (int8_t)reg2_6); // 10
++
++                int v2 = addclip20(reg3, mult1 >> 6, (mult1 >> 5) & 1); // 9
++                int v1 = addclip20(v2, mult2 >> 13, (mult2 >> 12) & 1); // 10
++                int subvar = addclip20(v1, (mult3 >> 6), (mult3 >> 5) & 1); // 11
++
++                ram1[3] = (uint32_t)v1;
++
++                v3 = addclip20(test, subvar ^ 0xfffff, 1); // 12
++
++                int mult4 = multi(v3, (int8_t)(filter >> 8));
++                int mult5 = multi(v3, (int8_t)((filter >> 1) & 127));
++                int v4 = addclip20(reg1, mult4 >> 6, (mult4 >> 5) & 1); // 14
++                int v5 = addclip20(v4, mult5 >> 13, (mult5 >> 12) & 1); // 15
++
++                ram1[1] = (uint32_t)v5;
++            }
++            else
++            {
++                // hack: use 32-bit math to avoid overflow
++                int mult1 = reg1 * (int8_t)(filter >> 8); // 8
++                int mult2 = reg1 * (int8_t)((filter >> 1) & 127); // 9
++                int mult3 = reg1 * (int8_t)reg2_6; // 10
++
++                int v2 = reg3 + (mult1 >> 6) + ((mult1 >> 5) & 1); // 9
++                int v1 = v2 + (mult2 >> 13) + ((mult2 >> 12) & 1); // 10
++                int subvar = v1 + (mult3 >> 6) + ((mult3 >> 5) & 1); // 11
++
++                ram1[3] = (uint32_t)v1;
++
++                int tests = test;
++                tests <<= 12;
++                tests >>= 12;
++
++                v3 = tests - subvar; // 12
++
++                int mult4 = v3 * (int8_t)(filter >> 8);
++                int mult5 = v3 * (int8_t)((filter >> 1) & 127);
++                int v4 = reg1 + (mult4 >> 6) + ((mult4 >> 5) & 1); // 14
++                int v5 = v4 + (mult5 >> 13) + ((mult5 >> 12) & 1); // 15
++
++                ram1[1] = (uint32_t)v5;
++            }
++
++
++            ram1[5] = (uint32_t)reference;
++
++            if (active && (ram2[6] & 1) != 0 && (ram2[8] & 0x4000) == 0 && !pcm.irq_assert && irq_flag)
++            {
++                //fprintf(stderr, "irq voice %i\n", slot);
++                if (pcm.nfs)
++                    ram2[8] |= 0x4000;
++                pcm.irq_assert = true;
++                pcm.irq_channel = (uint8_t)slot;
++                if (pcm.mcu->is_jv880)
++                    MCU_GA_SetGAInt(*pcm.mcu, 5, 1);
++                else
++                    // Skeletal JV880 shape: the assert goes DIRECT,
++                    // as Sterr1 sets its GA line from the PCM core.
++                    // (The old FIFO split's PushIrq branch is deleted
++                    // with the FIFO itself.) The assert-set (core 3,
++                    // under the state lock during a batch) and the
++                    // status-read ACK clear (core 2, under the state
++                    // lock) are serialized by the lock;
++                    // Interrupt_Handle only reads interrupt_pending,
++                    // so no unlocked RMW races the locked writers.
++                    // No double delivery: the IRQ FIFO no longer
++                    // exists, so this is the only delivery path.
++                    MCU_Interrupt_SetRequest(*pcm.mcu, INTERRUPT_SOURCE_IRQ0, 1);
++            }
++
++            int volmul1 = 0;
++            int volmul2 = 0;
++
++            calc_tv(pcm, 0, ram2[3], &ram2[9], active, &volmul1);
++            calc_tv(pcm, 1, ram2[4], &ram2[10], active, &volmul2);
++            calc_tv(pcm, 2, ram2[5], &ram2[11], active, NULL);
++
++            int sample = (ram2[6] & 2) == 0 ? (int)ram1[3] : v3;
++
++            int pan = active ? ram2[1] : 0;
++            int rc = active ? ram2[2] : 0;
++
++            // Mix inputs for the cross-slot vector pass below.
++            mix_sample[slot] = sample;
++            mix_vm1[slot] = volmul1;
++            mix_vm2[slot] = volmul2;
++            mix_pan[slot] = pan;
++            mix_rc[slot] = rc;
++            {
++                // Slot2 injection terms, resolved here (same mapping as
++                // the original two switches); the vector pass adds them
++                // to the accumulators, order-free by the sx20
++                // homomorphism.
++                int slot2 = (slot == pcm.config.reg_slots - 1) ? 31 : slot + 1;
++                int32_t injL = 0, injR = 0, injC0 = 0, injC1 = 0;
++                switch (slot2)
++                {
++                    case 17:
++                        injL = sx20(rcadd[0] >> 1) + (rcadd[0] & 1);
++                        injC1 = sx20(rcadd2[0] >> 1) + (rcadd2[0] & 1);
++                        break;
++                    case 18:
++                        injR = sx20(rcadd[1] >> 1) + (rcadd[1] & 1);
++                        injC1 = sx20(rcadd2[1] >> 1) + (rcadd2[1] & 1);
++                        break;
++                    case 21:
++                        injL = sx20(rcadd[2] >> 1) + (rcadd[2] & 1);
++                        injC0 = sx20(rcadd2[2] >> 1) + (rcadd2[2] & 1);
++                        break;
++                    case 22:
++                        injR = sx20(rcadd[3] >> 1) + (rcadd[3] & 1);
++                        injC1 = sx20(rcadd2[3] >> 1) + (rcadd2[3] & 1);
++                        break;
++                    case 23:
++                        injL = sx20(rcadd[4] >> 1) + (rcadd[4] & 1);
++                        injC0 = sx20(rcadd2[4] >> 1) + (rcadd2[4] & 1);
++                        break;
++                    case 31:
++                        injR = sx20(rcadd[5] >> 1) + (rcadd[5] & 1);
++                        injC1 = sx20(rcadd2[5] >> 1) + (rcadd2[5] & 1);
++                        break;
++                }
++                mix_injL[slot] = injL;
++                mix_injR[slot] = injR;
++                mix_injC0[slot] = injC0;
++                mix_injC1[slot] = injC1;
++            }
++
++            if (key && pcm.nfs)
++            {
++                ram2[7] &= ~0xf020;
++                ram2[7] |= (uint16_t)(((usenew || kon) ? newnibble : old_nibble) << 12);
++
++                // update key
++                ram2[7] |= (uint16_t)(key << 5);
++            }
++
++            if (!active)
++            {
++                if (pcm.nfs)
++                {
++                    ram1[1] = 0;
++                    ram1[3] = 0;
++                    ram1[5] = 0;
++                }
++
++                ram2[8] = 0;
++                ram2[9] = 0;
++                ram2[10] = 0;
++            }
++        }
++        // Cross-slot NEON mix: the mix chain runs in .4s lanes over
++        // groups of 4 slots, so coefficient vectors are loaded from the
++        // contiguous mix_* arrays -- no per-slot packing. Lanes beyond
++        // reg_slots are zero in all arrays and contribute zero terms.
++        // Accumulation is into 4 vector accumulators, combined once
++        // below; by the sx20 homomorphism the combined values are
++        // congruent mod 2^20 to the original serial sums, and every
++        // downstream observation (sx20 reads, write_mask low bits) is
++        // therefore identical.
++        {
++            typedef int int32x4_t __attribute__((vector_size(16)));
++            int32x4_t vaccL = {0, 0, 0, 0};
++            int32x4_t vaccR = {0, 0, 0, 0};
++            int32x4_t vaccC0 = {0, 0, 0, 0};
++            int32x4_t vaccC1 = {0, 0, 0, 0};
++            const int ngroups = (pcm.config.reg_slots + 3) / 4;
++            for (int g = 0; g < ngroups; g++)
++            {
++                const int32_t *pSample = mix_sample + g * 4;
++                const int32_t *pVm1 = mix_vm1 + g * 4;
++                const int32_t *pVm2 = mix_vm2 + g * 4;
++                const int32_t *pPan = mix_pan + g * 4;
++                const int32_t *pRc = mix_rc + g * 4;
++                const int32_t *pInjL = mix_injL + g * 4;
++                const int32_t *pInjR = mix_injR + g * 4;
++                const int32_t *pInjC0 = mix_injC0 + g * 4;
++                const int32_t *pInjC1 = mix_injC1 + g * 4;
++                __asm__ volatile (
++                    // Inputs: q0=sample q1=vm1 q2=vm2 q3=pan q4=rc
++                    // q5=injL q6=injR q7=injC0 q8=injC1. Accumulators
++                    // are the "+w" operands (never hardcode their
++                    // registers); v0-v19/v30/v31 are clobbered scratch.
++                    "ldr q0, [%[pSample]]\n\t"
++                    "ldr q1, [%[pVm1]]\n\t"
++                    "ldr q2, [%[pVm2]]\n\t"
++                    "ldr q3, [%[pPan]]\n\t"
++                    "ldr q4, [%[pRc]]\n\t"
++                    "ldr q5, [%[pInjL]]\n\t"
++                    "ldr q6, [%[pInjR]]\n\t"
++                    "ldr q7, [%[pInjC0]]\n\t"
++                    "ldr q8, [%[pInjC1]]\n\t"
++                    // Broadcast constants (2 insns/group).
++                    "dup v30.4s, %w[c127]\n\t"
++                    "dup v31.4s, %w[c1]\n\t"
++                    // V_s = sx20(sample)
++                    "shl v9.4s, v0.4s, #12\n\t"
++                    "sshr v9.4s, v9.4s, #12\n\t"
++                    // volmul1 bytes: b1hi=(int8)(vm1>>8),
++                    // b1lo=(int8)((vm1>>1)&127)
++                    "sshr v10.4s, v1.4s, #8\n\t"
++                    "shl v10.4s, v10.4s, #24\n\t"
++                    "sshr v10.4s, v10.4s, #24\n\t"
++                    "sshr v11.4s, v1.4s, #1\n\t"
++                    "and v11.16b, v11.16b, v30.16b\n\t"
++                    "mul v12.4s, v9.4s, v10.4s\n\t"
++                    "mul v13.4s, v9.4s, v11.4s\n\t"
++                    // sample2 = sx20(mv1>>6)+sx20(mv2>>13)+cin
++                    "sshr v14.4s, v12.4s, #6\n\t"
++                    "shl v14.4s, v14.4s, #12\n\t"
++                    "sshr v14.4s, v14.4s, #12\n\t"
++                    "sshr v15.4s, v13.4s, #13\n\t"
++                    "shl v15.4s, v15.4s, #12\n\t"
++                    "sshr v15.4s, v15.4s, #12\n\t"
++                    "sshr v16.4s, v13.4s, #12\n\t"
++                    "sshr v17.4s, v12.4s, #5\n\t"
++                    "orr v16.16b, v16.16b, v17.16b\n\t"
++                    "and v16.16b, v16.16b, v31.16b\n\t"
++                    "add v14.4s, v14.4s, v15.4s\n\t"
++                    "add v14.4s, v14.4s, v16.4s\n\t"
++                    // volmul2 bytes + multiv3/4
++                    "sshr v10.4s, v2.4s, #8\n\t"
++                    "shl v10.4s, v10.4s, #24\n\t"
++                    "sshr v10.4s, v10.4s, #24\n\t"
++                    "sshr v11.4s, v2.4s, #1\n\t"
++                    "and v11.16b, v11.16b, v30.16b\n\t"
++                    "shl v18.4s, v14.4s, #12\n\t"
++                    "sshr v18.4s, v18.4s, #12\n\t"
++                    "mul v12.4s, v18.4s, v10.4s\n\t"
++                    "mul v13.4s, v18.4s, v11.4s\n\t"
++                    // sample3 (same shape as sample2)
++                    "sshr v14.4s, v12.4s, #6\n\t"
++                    "shl v14.4s, v14.4s, #12\n\t"
++                    "sshr v14.4s, v14.4s, #12\n\t"
++                    "sshr v15.4s, v13.4s, #13\n\t"
++                    "shl v15.4s, v15.4s, #12\n\t"
++                    "sshr v15.4s, v15.4s, #12\n\t"
++                    "sshr v16.4s, v13.4s, #12\n\t"
++                    "sshr v17.4s, v12.4s, #5\n\t"
++                    "orr v16.16b, v16.16b, v17.16b\n\t"
++                    "and v16.16b, v16.16b, v31.16b\n\t"
++                    "add v14.4s, v14.4s, v15.4s\n\t"
++                    "add v14.4s, v14.4s, v16.4s\n\t"
++                    // sx20(sample3), shared by pan/rc multis
++                    "shl v18.4s, v14.4s, #12\n\t"
++                    "sshr v18.4s, v18.4s, #12\n\t"
++                    // pan bytes + sampl/sampr
++                    "sshr v10.4s, v3.4s, #8\n\t"
++                    "shl v10.4s, v10.4s, #24\n\t"
++                    "sshr v10.4s, v10.4s, #24\n\t"
++                    "shl v11.4s, v3.4s, #24\n\t"
++                    "sshr v11.4s, v11.4s, #24\n\t"
++                    "mul v12.4s, v18.4s, v10.4s\n\t"
++                    "mul v13.4s, v18.4s, v11.4s\n\t"
++                    // rc bytes + rc0/rc1 (>>5)
++                    "sshr v10.4s, v4.4s, #8\n\t"
++                    "shl v10.4s, v10.4s, #24\n\t"
++                    "sshr v10.4s, v10.4s, #24\n\t"
++                    "shl v11.4s, v4.4s, #24\n\t"
++                    "sshr v11.4s, v11.4s, #24\n\t"
++                    "mul v15.4s, v18.4s, v10.4s\n\t"
++                    "sshr v15.4s, v15.4s, #5\n\t"
++                    "mul v16.4s, v18.4s, v11.4s\n\t"
++                    "sshr v16.4s, v16.4s, #5\n\t"
++                    // termL = sx20(sampl>>6) + ((sampl>>5)&1)
++                    "sshr v17.4s, v12.4s, #6\n\t"
++                    "shl v17.4s, v17.4s, #12\n\t"
++                    "sshr v17.4s, v17.4s, #12\n\t"
++                    "sshr v18.4s, v12.4s, #5\n\t"
++                    "and v18.16b, v18.16b, v31.16b\n\t"
++                    "add v17.4s, v17.4s, v18.4s\n\t"
++                    // termR
++                    "sshr v18.4s, v13.4s, #6\n\t"
++                    "shl v18.4s, v18.4s, #12\n\t"
++                    "sshr v18.4s, v18.4s, #12\n\t"
++                    "sshr v19.4s, v13.4s, #5\n\t"
++                    "and v19.16b, v19.16b, v31.16b\n\t"
++                    "add v18.4s, v18.4s, v19.4s\n\t"
++                    // termC0 = sx20(rc0>>1) + (rc0&1)
++                    "sshr v19.4s, v15.4s, #1\n\t"
++                    "shl v19.4s, v19.4s, #12\n\t"
++                    "sshr v19.4s, v19.4s, #12\n\t"
++                    "and v15.16b, v15.16b, v31.16b\n\t"
++                    "add v19.4s, v19.4s, v15.4s\n\t"
++                    // termC1
++                    "sshr v15.4s, v16.4s, #1\n\t"
++                    "shl v15.4s, v15.4s, #12\n\t"
++                    "sshr v15.4s, v15.4s, #12\n\t"
++                    "and v16.16b, v16.16b, v31.16b\n\t"
++                    "add v15.4s, v15.4s, v16.4s\n\t"
++                    // Accumulate (operand registers, never hardcoded).
++                    "add %[vaccL].4s, %[vaccL].4s, v17.4s\n\t"
++                    "add %[vaccL].4s, %[vaccL].4s, v5.4s\n\t"
++                    "add %[vaccR].4s, %[vaccR].4s, v18.4s\n\t"
++                    "add %[vaccR].4s, %[vaccR].4s, v6.4s\n\t"
++                    "add %[vaccC0].4s, %[vaccC0].4s, v19.4s\n\t"
++                    "add %[vaccC0].4s, %[vaccC0].4s, v7.4s\n\t"
++                    "add %[vaccC1].4s, %[vaccC1].4s, v15.4s\n\t"
++                    "add %[vaccC1].4s, %[vaccC1].4s, v8.4s\n\t"
++                    : [vaccL] "+w" (vaccL), [vaccR] "+w" (vaccR),
++                      [vaccC0] "+w" (vaccC0), [vaccC1] "+w" (vaccC1)
++                    : [pSample] "r" (pSample), [pVm1] "r" (pVm1),
++                      [pVm2] "r" (pVm2), [pPan] "r" (pPan),
++                      [pRc] "r" (pRc), [pInjL] "r" (pInjL),
++                      [pInjR] "r" (pInjR), [pInjC0] "r" (pInjC0),
++                      [pInjC1] "r" (pInjC1), [c127] "r" (127),
++                      [c1] "r" (1)
++                    : "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
++                      "v8", "v9", "v10", "v11", "v12", "v13", "v14",
++                      "v15", "v16", "v17", "v18", "v19", "v30", "v31",
++                      "memory");
++            }
++            // Combine: horizontal sums of the 4 lanes. Store the
++            // vectors to the stack once per tick and sum in C (the
++            // per-tick cost is negligible; ADDV would save ~20 insns
++            // per tick and is left as a micro-optimization).
++            int32_t hL[4], hR[4], hC0[4], hC1[4];
++            __asm__ volatile (
++                "st1 {%[vaccL].4s}, [%[hL]]\n\t"
++                "st1 {%[vaccR].4s}, [%[hR]]\n\t"
++                "st1 {%[vaccC0].4s}, [%[hC0]]\n\t"
++                "st1 {%[vaccC1].4s}, [%[hC1]]\n\t"
++                : : [vaccL] "w" (vaccL), [vaccR] "w" (vaccR),
++                    [vaccC0] "w" (vaccC0), [vaccC1] "w" (vaccC1),
++                    [hL] "r" (hL), [hR] "r" (hR),
++                    [hC0] "r" (hC0), [hC1] "r" (hC1)
++                : "memory");
++            pcm.accum_l = hL[0] + hL[1] + hL[2] + hL[3];
++            pcm.accum_r = hR[0] + hR[1] + hR[2] + hR[3];
++            pcm.rcsum[0] = hC0[0] + hC0[1] + hC0[2] + hC0[3];
++            pcm.rcsum[1] = hC1[0] + hC1[1] + hC1[2] + hC1[3];
++            // ram1[31][1]/[3] intentionally left at their pre-loop
++            // zero (unobserved after the tick; see splitacc note).
++        }
++
++        // PMU (shaped-var): voice-mix cycles for this batch,
++        // accumulated PER BATCH (not per tick) to keep read overhead
++        // negligible. NOP-corrected, clamped at 0.
++        if (g_splitT)
++        {
++            const uint64_t nMixDelta = PMU_ReadCycles() - nMixStartCyc;
++            const uint64_t nMixNop = g_splitT->nop_cyc3;
++            g_splitT->mix_cyc = g_splitT->mix_cyc + (nMixDelta >= nMixNop ? nMixDelta - nMixNop : 0);
++        }
++
++        if (pcm.nfs)
++        {
++            pcm.ram2[31][7] |= 0x20;
++        }
++
++        pcm.nfs = true;
++
++        uint64_t new_cycles = (uint64_t)(pcm.config.reg_slots + 1) * 25;
++
++        pcm.cycles += pcm.mcu->is_jv880 ? (new_cycles * 25) / 29 : new_cycles;
++
++        // mt32-pi dual-core split: publish the RenderStep of the tick
++        // that just advanced, so the MCU thread's tick rule can tell
++        // which ticks have rendered. No-op when inactive / JV880.
++        // The advance passed is the actual cycles advanced (JV880
++        // scales it), mirroring the prototype.
++        if (g_splitT)
++            g_splitT->PublishRenderedStep(pcm, pcm.mcu->is_jv880 ? (new_cycles * 25) / 29 : new_cycles);
++    }
++
++    if (nProfileStart)
++    {
++        NukedProfile().nPCMUs += pProfileClock() - nProfileStart;
++        ++NukedProfile().nPCMUpdates;
++    }
++}
++
 +// Variant descriptor table (data-driven dispatch, 2026-10-31
 +// ~09:39): adding a variant is one table entry + its PCM_Update_*
-+// function -- no switch to rewrite, no minimal.cpp change except the
-+// sequence_done fields if the count grows past the current four.
++// function -- no switch to rewrite. The table now has six entries;
++// minimal.cpp sequence_done fields were extended to match (v4, v5).
 +const PCMVariantDesc g_pcmVariants[] = {
 +    {0, "baseline", "shaped-diag code path unchanged", PCM_Update},
 +    {1, "sched", "round-1 lambda-pair slot loop", PCM_Update_Sched},
 +    {2, "pipe", "round-2 head/tail pair split", PCM_Update_Pipe},
 +    {3, "neon2", "round-2 NEON mix-tail v2 (no lane inserts, full-width loads)", PCM_Update_Neon2},
++    {4, "splitacc", "round-3 NEON v2 block + even/odd split accumulators", PCM_Update_Splitacc},
++    {5, "layout", "round-3 cross-slot NEON, no per-slot packing", PCM_Update_Layout},
 +};
 +const int g_pcmVariantCount = sizeof(g_pcmVariants) / sizeof(g_pcmVariants[0]);
 +
