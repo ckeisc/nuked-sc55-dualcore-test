@@ -272,6 +272,21 @@ constexpr float Sample24BitMax = static_cast<float>((1 << 23) - 1);
 const char MinimalStatsPath[] = "SD:/shaped-var3-stats.log";
 constexpr u64 WindowUs = 5000000ULL;	// 5 s -> 240,000 frames at 48 kHz
 
+// Tick-debug fault record type, defined here so StopSplitPCM and
+// InitSplitState (earlier in the file than the record instance) can
+// use it. The instance itself is defined before PCMLoop below.
+struct TickDbgFaultRecord
+{
+	uint32_t esr;		// ESR_EL1: EC in bits 31:26, ISS in 25:0
+	uint32_t _pad0;
+	uint64_t far;		// FAR_EL1 (valid for abort classes)
+	uint64_t elr;		// ELR_EL1: faulting PC
+	uint64_t spsr;		// SPSR_EL1
+	uint32_t valid;		// 1 once a fault has been recorded
+	uint32_t _pad1;
+};
+extern TickDbgFaultRecord g_tickdbg_fault;
+
 // Scheduler-free pause for spin waits (this kernel registers no
 // CScheduler tasks, so CScheduler::Yield() can never return --
 // GetNextTask() always yields MAX_TASKS with m_nTasks == 0). The ARM
@@ -752,19 +767,37 @@ void CMinimalApp::StopSplitPCM()
 	// timeout, log core-3 state and proceed so the stall is
 	// diagnosable instead of silent.
 	const u64 nParkStartUs = CTimer::GetClockTicks();
+	const u64 nTicksAtWaitStart = (m_pSplitState != nullptr) ? m_pSplitState->ticks : 0;
 	while (!m_bPCMIdle)
 	{
 		SplitDMB();
 		if (CTimer::GetClockTicks() - nParkStartUs >= 5000000ULL)
 		{
 			ThreadSplitStateCircle* pS = m_pSplitState;
-			LogLine("splitpark_timeout ticks=%llu idle=%d raw_lock=%u pub=%llu rendered=%llu writer_want=%u",
+			LogLine("splitpark_timeout ticks=%llu idle=%d raw_lock=%u pub=%llu rendered=%llu writer_want=%u ticks_start=%llu",
 			        static_cast<unsigned long long>(pS != nullptr ? pS->ticks : 0),
 			        m_bPCMIdle ? 1 : 0,
 			        pS != nullptr ? pS->raw_lock : 0,
 			        static_cast<unsigned long long>(pS != nullptr ? pS->cycles_pub : 0),
 			        static_cast<unsigned long long>(pS != nullptr ? pS->pcm_rendered : 0),
-			        pS != nullptr ? pS->writer_want : 0);
+			        pS != nullptr ? pS->writer_want : 0,
+			        static_cast<unsigned long long>(nTicksAtWaitStart));
+			// Tick-debug: a fault parks core 3 inside its batch, so
+			// a valid record here proves fault (not spin). Ticks
+			// frozen across the wait (ticks == ticks_start) proves
+			// stuck (not slow). No record + frozen ticks = spin
+			// inside the render; writer_want set would implicate
+			// the hand-off wait instead (not seen to date).
+			SplitDMB();
+			if (g_tickdbg_fault.valid != 0)
+			{
+				SplitDMB();
+				LogLine("core3_fault esr=%08x far=%016llx elr=%016llx spsr=%016llx",
+				        g_tickdbg_fault.esr,
+				        static_cast<unsigned long long>(g_tickdbg_fault.far),
+				        static_cast<unsigned long long>(g_tickdbg_fault.elr),
+				        static_cast<unsigned long long>(g_tickdbg_fault.spsr));
+			}
 			break;
 		}
 		MiniPause();
@@ -792,6 +825,13 @@ void CMinimalApp::InitSplitState(bool bClearRing)
 	}
 
 	m_pSplitState->InitFromPCM(m_pEmulator->GetPCM(), m_pEmulator->GetMCU());
+
+	// Tick-debug: clear any core-3 fault record from a previous run.
+	// Safe here: the park timeout log (which reports a record) runs
+	// before this advance, so a logged fault is already on the SD
+	// card before it is cleared.
+	g_tickdbg_fault.valid = 0;
+	SplitDMB();
 
 	if (bClearRing)
 	{
@@ -2223,8 +2263,83 @@ void CMinimalApp::AudioLoop()
 	}
 }
 
+// Tick-debug core-3 fault record instance (diagnostic only). The
+// minimal kernel installs no Circle exception handler, so a core-3
+// fault today hangs silently with no SD-log trace. Core 3's own
+// sync-exception handler (below) writes this record and parks; core 2
+// reads it at the park timeout log, which distinguishes a fault from
+// a spin. Written by core 3 via asm stores, read by core 2 after a
+// barrier; cleared in InitSplitState (which runs after the timeout
+// log, so a logged fault is already on the SD card before it is
+// cleared).
+alignas(64) TickDbgFaultRecord g_tickdbg_fault{};
+alignas(2048) uint32_t g_tickdbg_vectors[512]{};
+
+// Core-3 sync-exception handler: record ESR/FAR/ELR/SPSR, then park.
+// Uses no stack and never returns, so it is safe on any interrupted
+// SP. The parked core never sets m_bPCMIdle, so core 2's park timeout
+// always fires on a fault and logs the record.
+__asm__(
+	".section .text\n"
+	".globl tickdbg_fault_handler\n"
+	"tickdbg_fault_handler:\n"
+	"    mrs x0, esr_el1\n"
+	"    mrs x1, far_el1\n"
+	"    mrs x2, elr_el1\n"
+	"    mrs x3, spsr_el1\n"
+	"    adrp x4, g_tickdbg_fault\n"
+	"    add x4, x4, #:lo12:g_tickdbg_fault\n"
+	"    str w0, [x4, #0]\n"
+	"    str x1, [x4, #8]\n"
+	"    str x2, [x4, #16]\n"
+	"    str x3, [x4, #24]\n"
+	"    dmb sy\n"
+	"    mov w5, #1\n"
+	"    str w5, [x4, #32]\n"
+	"    dmb sy\n"
+	"1:  wfe\n"
+	"    b 1b\n"
+);
+extern "C" void tickdbg_fault_handler();
+
+// Install core-3-only fault vectors. Sync entries (offsets 0x000,
+// 0x200, 0x400, 0x600) branch to the recorder above; every other
+// entry delegates to Circle's original table, so IRQ/FIQ/SError
+// behavior on core 3 is unchanged. Runs once, on core 3 only
+// (PCMLoop is core-3-only by Run's dispatch), so core 2's vectors
+// are never touched.
+static void InstallCore3FaultVectors()
+{
+	static bool s_bInstalled = false;
+	if (s_bInstalled)
+		return;
+	s_bInstalled = true;
+	uint64_t nOrig = 0;
+	__asm__ volatile ("mrs %0, vbar_el1" : "=r" (nOrig));
+	const uint64_t nHandler = reinterpret_cast<uint64_t>(&tickdbg_fault_handler);
+	for (int i = 0; i < 16; ++i)
+	{
+		const uint64_t nEntry = reinterpret_cast<uint64_t>(&g_tickdbg_vectors[i * 32]);
+		uint64_t nTarget;
+		if (i == 0 || i == 4 || i == 8 || i == 12)
+			nTarget = nHandler;
+		else
+			nTarget = nOrig + (uint64_t)(i * 128);
+		const int64_t nOff = (int64_t)(nTarget - nEntry) / 4;
+		g_tickdbg_vectors[i * 32] = 0x14000000u | (uint32_t)(nOff & 0x3FFFFFF);
+	}
+	__builtin___clear_cache(reinterpret_cast<char*>(&g_tickdbg_vectors[0]),
+	                        reinterpret_cast<char*>(&g_tickdbg_vectors[512]));
+	__asm__ volatile ("dsb sy; isb" ::: "memory");
+	__asm__ volatile ("msr vbar_el1, %0" :: "r" (reinterpret_cast<uint64_t>(&g_tickdbg_vectors[0])) : "memory");
+	__asm__ volatile ("isb" ::: "memory");
+}
+
 void CMinimalApp::PCMLoop()
 {
+	// Tick-debug: install core-3 fault vectors before any batch, so
+	// a fault inside a tick render is recorded instead of silent.
+	InstallCore3FaultVectors();
 	// Core 3 only: PCM tick batches. PMU first: enable + validate +
 	// NOP-calibrate BEFORE any batch (PCMTaskIteration reads the
 	// counter), then flag the result for core 2's boot line
